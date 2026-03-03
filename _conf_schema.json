@@ -1,0 +1,57 @@
+{
+  "news_type": {
+    "description": "新闻获取方式: vikiboss_api / indirect / direct",
+    "type": "string",
+    "default": "indirect"
+  },
+  "vikiboss_api": {
+    "description": "vikiboss API 地址（news_type=vikiboss_api 时使用）",
+    "type": "string",
+    "default": "https://60s-api.viki.moe/v2/60s"
+  },
+  "indirect": {
+    "description": "间接API地址（news_type=indirect 时使用）",
+    "type": "string",
+    "default": ""
+  },
+  "img_key": {
+    "description": "间接API返回JSON中图片URL的键名",
+    "type": "string",
+    "default": "imageUrl"
+  },
+  "date_key": {
+    "description": "间接API返回JSON中日期的键名",
+    "type": "string",
+    "default": "datatime"
+  },
+  "direct": {
+    "description": "直接图片URL（news_type=direct 时使用）",
+    "type": "string",
+    "default": ""
+  },
+  "push_start_time": {
+    "description": "推送时间窗口开始（HH:MM），到点开始依次推送",
+    "type": "string",
+    "default": "07:00"
+  },
+  "push_end_time": {
+    "description": "推送时间窗口结束（HH:MM），所有推送在此之前完成",
+    "type": "string",
+    "default": "07:15"
+  },
+  "push_time": {
+    "description": "（兼容旧版）推送时间，新版请用 push_start_time",
+    "type": "string",
+    "default": "07:00"
+  },
+  "save_days": {
+    "description": "新闻图片本地保留天数",
+    "type": "int",
+    "default": 3
+  },
+  "min_push_interval": {
+    "description": "每个目标之间的最小推送间隔（秒），防风控",
+    "type": "float",
+    "default": 5.0
+  }
+}
