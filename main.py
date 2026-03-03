@@ -109,7 +109,7 @@ class Daily60sNewsPlugin(Star):
 
         logger.info(f"[每日新闻] 已加载，已知目标: {len(self._data['targets'])} 个")
         logger.info(f"[每日新闻] 推送窗口: {self.push_start_time} ~ {self.push_end_time}")
-
+        # 注意：如果 regex 抢走了命令，需要在 AstrBot 后台调整本插件优先级到最低
         self._monitoring_task = asyncio.create_task(self._daily_task())
 
     # ==================== 数据持久化 ====================
@@ -142,6 +142,19 @@ class Daily60sNewsPlugin(Star):
                 old_file.rename(old_file.with_suffix(".json.bak"))
             except Exception as e:
                 logger.error(f"迁移旧数据失败: {e}")
+
+        # 补全旧数据缺少的字段
+        fixed = 0
+        for uid, info in self._data.get("targets", {}).items():
+            if "platform" not in info or "msg_type" not in info:
+                parsed = _parse_msg_origin(uid)
+                info["platform"] = parsed["platform"]
+                info["msg_type"] = parsed["msg_type"]
+                info["target_id"] = parsed["target_id"]
+                fixed += 1
+        if fixed > 0:
+            self._save_data()
+            logger.info(f"[每日新闻] 补全了 {fixed} 条旧数据的字段")
 
     def _save_data(self):
         try:
@@ -225,23 +238,39 @@ class Daily60sNewsPlugin(Star):
     @filter.on_decorating_result()
     async def _on_any_result(self, event: AstrMessageEvent):
         """
-        每当有消息产生了回复结果时触发。
-        用于记录活跃度，不修改回复内容。
+        bot 产生回复时触发（作为补充检测）。
         """
         if event and hasattr(event, "unified_msg_origin"):
-            uid = event.unified_msg_origin
-            # Bug7 防护：忽略 bot 自己
-            sender_id = str(event.get_sender_id()) if hasattr(event, "get_sender_id") else ""
-            if sender_id and sender_id == str(getattr(self.context, "bot_id", "")):
-                return
-            self._mark_active(uid)
+            self._mark_active_from_event(event)
 
-    # ---- 方案B：命令/工具触发时顺带记录 ----
-    # 作为方案A的补充，确保用户主动交互时一定被记录
+    def _is_bot_message(self, event: AstrMessageEvent) -> bool:
+        """判断消息是否来自 bot 自身（排除 bot 自己发的消息和其他插件联动）"""
+        try:
+            sender_id = str(event.get_sender_id()) if hasattr(event, "get_sender_id") else ""
+            bot_id = str(getattr(self.context, "bot_id", ""))
+            if sender_id and bot_id and sender_id == bot_id:
+                return True
+        except Exception:
+            pass
+        return False
+
     def _mark_active_from_event(self, event: AstrMessageEvent):
-        """从事件中提取 unified_id 并标记活跃"""
-        if event and hasattr(event, "unified_msg_origin"):
-            self._mark_active(event.unified_msg_origin)
+        """从事件中提取 unified_id 并标记活跃（排除 bot 自身）"""
+        if not event or not hasattr(event, "unified_msg_origin"):
+            return
+        if self._is_bot_message(event):
+            return
+        self._mark_active(event.unified_msg_origin)
+
+    @filter.regex(r"[\s\S]*")
+    async def _catch_all_messages(self, event: AstrMessageEvent):
+        """
+        捕获所有消息用于记录活跃度。
+        不 yield 任何内容 = 不产生回复 = 不阻断其他插件处理。
+        群聊有人说话、私聊有人找 bot，都会被记录。
+        """
+        self._mark_active_from_event(event)
+        # 关键：不 yield 任何东西，消息继续流转给其他 handler
 
     # ==================== LLM 工具 ====================
 
@@ -402,8 +431,9 @@ class Daily60sNewsPlugin(Star):
                 status = "✅活跃"
 
             type_label = _get_type_label(uid)
-            platform = info.get("platform", "?")
-            last = info.get("last_push_date", "从未")
+            parsed = _parse_msg_origin(uid)
+            platform = parsed["platform"]
+            last = info.get("last_push_date") or "从未"
             lines.append(f"  {status} [{type_label}] {platform} | 上次:{last}\n    {uid}")
 
         text = "\n".join(lines)
