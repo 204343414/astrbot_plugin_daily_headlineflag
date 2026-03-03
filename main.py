@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Tuple
@@ -22,10 +23,53 @@ def _file_exists(path: str) -> bool:
     return os.path.exists(path)
 
 
+def _parse_msg_origin(unified_id: str) -> dict:
+    """
+    解析 unified_msg_origin，提取平台、消息类型、ID
+    格式: 前缀:中缀:后缀
+    例: aiocqhttp:GroupMessage:987654321
+        wechatpadpro:GroupMessage:123456789@chatroom
+    """
+    parts = unified_id.split(":", 2)  # 最多分3段（后缀可能包含冒号）
+    result = {
+        "platform": parts[0] if len(parts) > 0 else "unknown",
+        "msg_type": parts[1] if len(parts) > 1 else "unknown",
+        "target_id": parts[2] if len(parts) > 2 else "unknown",
+    }
+    return result
+
+
+def _is_group(unified_id: str) -> bool:
+    """判断是否为群聊"""
+    return "GroupMessage" in unified_id
+
+
+def _is_private(unified_id: str) -> bool:
+    """判断是否为私聊"""
+    return "FriendMessage" in unified_id
+
+
+def _is_other(unified_id: str) -> bool:
+    """判断是否为其他类型"""
+    return "OtherMessage" in unified_id
+
+
+def _get_type_label(unified_id: str) -> str:
+    """获取可读的类型标签"""
+    if _is_group(unified_id):
+        return "群聊"
+    elif _is_private(unified_id):
+        return "私聊"
+    elif _is_other(unified_id):
+        return "其他"
+    else:
+        return "未知"
+
+
 @register(
     "每日60s读懂世界",
     "eaton",
-    "AstrBot 每日60s新闻插件。自动检测活跃会话推送，支持命令获取。",
+    "AstrBot 每日60s新闻插件。自动检测活跃会话推送，群聊私聊通用。",
     "0.0.5",
 )
 class Daily60sNewsPlugin(Star):
@@ -53,32 +97,24 @@ class Daily60sNewsPlugin(Star):
         self.min_push_interval = self.config.get("min_push_interval", 5.0)
 
         # ========= 核心数据 =========
-        # data_file 存储所有会话的推送状态
-        # 结构:
-        # {
-        #   "targets": {
-        #     "unified_id": {
-        #       "active_after_push": true/false,  # 上次推送后是否有人说话
-        #       "dormant": false,                  # 是否休眠（没人说话就休眠）
-        #       "unsubscribed": false,             # 是否主动退订
-        #       "last_push_date": "2025-01-01"     # 上次推送日期
-        #     }
-        #   }
-        # }
         self.data_file = SAVED_NEWS_DIR / "news_push_data.json"
         self._data = {"targets": {}}
         self._load_data()
 
-        logger.info(f"[每日新闻] 插件已加载，已知目标: {len(self._data['targets'])} 个")
+        # ========= 内存活跃集合（解决 Bug4：减少文件I/O） =========
+        # 只在内存中记录，定时批量写入文件
+        self._pending_active: set = set()
+        self._last_save_time: float = time.time()
+        self._save_interval: float = 60.0  # 最多60秒写一次文件
+
+        logger.info(f"[每日新闻] 已加载，已知目标: {len(self._data['targets'])} 个")
         logger.info(f"[每日新闻] 推送窗口: {self.push_start_time} ~ {self.push_end_time}")
 
-        # 启动定时任务
         self._monitoring_task = asyncio.create_task(self._daily_task())
 
     # ==================== 数据持久化 ====================
 
     def _load_data(self):
-        """加载推送数据"""
         if self.data_file.exists():
             try:
                 with open(self.data_file, "r", encoding="utf-8") as f:
@@ -89,7 +125,7 @@ class Daily60sNewsPlugin(Star):
                 logger.error(f"加载推送数据失败: {e}")
                 self._data = {"targets": {}}
 
-        # 兼容旧版: 迁移 push_groups.json
+        # 兼容旧版迁移
         old_file = SAVED_NEWS_DIR / "push_groups.json"
         if old_file.exists():
             try:
@@ -98,12 +134,7 @@ class Daily60sNewsPlugin(Star):
                 count = 0
                 for g in old_groups:
                     if g not in self._data["targets"]:
-                        self._data["targets"][g] = {
-                            "active_after_push": True,
-                            "dormant": False,
-                            "unsubscribed": False,
-                            "last_push_date": "",
-                        }
+                        self._data["targets"][g] = self._make_default_target(g, pre_active=True)
                         count += 1
                 if count > 0:
                     self._save_data()
@@ -113,66 +144,117 @@ class Daily60sNewsPlugin(Star):
                 logger.error(f"迁移旧数据失败: {e}")
 
     def _save_data(self):
-        """保存推送数据"""
         try:
             with open(self.data_file, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
+            self._last_save_time = time.time()
         except Exception as e:
             logger.error(f"保存推送数据失败: {e}")
+
+    def _save_data_throttled(self):
+        """
+        节流保存：距离上次保存超过 _save_interval 秒才真正写文件
+        解决 Bug4：避免每条消息都写文件
+        """
+        now = time.time()
+        if now - self._last_save_time >= self._save_interval:
+            self._save_data()
+
+    def _flush_pending_active(self):
+        """
+        将内存中的活跃记录批量写入数据
+        在推送前、插件卸载时调用
+        """
+        if not self._pending_active:
+            return
+        for uid in self._pending_active:
+            if uid in self._data["targets"]:
+                self._data["targets"][uid]["active_after_push"] = True
+                if self._data["targets"][uid].get("dormant"):
+                    self._data["targets"][uid]["dormant"] = False
+                    logger.info(f"[每日新闻] {_get_type_label(uid)} {uid} 从休眠恢复")
+        self._pending_active.clear()
+        self._save_data()
+
+    def _make_default_target(self, unified_id: str, pre_active: bool = False) -> dict:
+        """
+        创建默认的目标数据结构
+        pre_active: True 表示创建时就标记为活跃（用于迁移等场景）
+        """
+        parsed = _parse_msg_origin(unified_id)
+        return {
+            "platform": parsed["platform"],
+            "msg_type": parsed["msg_type"],      # GroupMessage / FriendMessage / OtherMessage
+            "target_id": parsed["target_id"],
+            "active_after_push": pre_active,
+            "dormant": not pre_active,            # 新发现的默认休眠，等说话再激活
+            "unsubscribed": False,
+            "last_push_date": "",
+        }
 
     def _get_target(self, unified_id: str) -> dict:
         """获取目标信息，不存在则自动创建"""
         if unified_id not in self._data["targets"]:
-            self._data["targets"][unified_id] = {
-                "active_after_push": False,  # 新发现的，还没说过话呢（等下面记录说话再设True）
-                "dormant": True,             # 默认休眠，说了话才激活
-                "unsubscribed": False,
-                "last_push_date": "",
-            }
+            # Bug6 防护：OtherMessage 类型也记录，但推送时会跳过
+            self._data["targets"][unified_id] = self._make_default_target(unified_id)
             self._save_data()
-            logger.info(f"[每日新闻] 发现新会话: {unified_id}")
+            type_label = _get_type_label(unified_id)
+            logger.info(f"[每日新闻] 发现新会话 [{type_label}]: {unified_id}")
         return self._data["targets"][unified_id]
 
-    # ==================== 活跃度检测 ====================
+    # ==================== 活跃度检测（重写方案，解决 Bug2/3） ====================
 
     def _mark_active(self, unified_id: str):
         """
-        标记某个会话有人说话了。
-        - 如果在休眠中 → 解除休眠，下次推送时会推
-        - active_after_push 设为 True
+        标记某个会话有人说话。
+        只操作内存，不立即写文件（解决 Bug4）。
         """
-        target = self._get_target(unified_id)
-        changed = False
+        # 确保目标存在
+        self._get_target(unified_id)
 
-        if not target.get("active_after_push"):
-            target["active_after_push"] = True
-            changed = True
+        # 加入待处理集合
+        self._pending_active.add(unified_id)
 
-        if target.get("dormant"):
-            target["dormant"] = False
-            changed = True
-            logger.info(f"[每日新闻] {unified_id} 有人说话，从休眠中恢复")
+        # 节流保存
+        self._save_data_throttled()
 
-        if changed:
-            self._save_data()
-
-    @filter.regex(r"[\s\S]*")
-    async def _catch_all_messages(self, event: AstrMessageEvent):
+    # ---- 方案A：通过 on_decorating_result 钩子 ----
+    # 优点：不干扰其他插件和 LLM
+    # 缺点：只有触发了 bot 回复的消息才会被捕获
+    #        纯群聊闲聊（没人 @bot）不会被记录
+    @filter.on_decorating_result()
+    async def _on_any_result(self, event: AstrMessageEvent):
         """
-        监听所有消息，记录活跃度。
-        不产生回复，不干扰其他插件。
+        每当有消息产生了回复结果时触发。
+        用于记录活跃度，不修改回复内容。
         """
-        unified_id = event.unified_msg_origin
-        self._mark_active(unified_id)
-        # 不yield，不回复
+        if event and hasattr(event, "unified_msg_origin"):
+            uid = event.unified_msg_origin
+            # Bug7 防护：忽略 bot 自己
+            sender_id = str(event.get_sender_id()) if hasattr(event, "get_sender_id") else ""
+            if sender_id and sender_id == str(getattr(self.context, "bot_id", "")):
+                return
+            self._mark_active(uid)
 
-    # ==================== LLM工具 ====================
+    # ---- 方案B：命令/工具触发时顺带记录 ----
+    # 作为方案A的补充，确保用户主动交互时一定被记录
+    def _mark_active_from_event(self, event: AstrMessageEvent):
+        """从事件中提取 unified_id 并标记活跃"""
+        if event and hasattr(event, "unified_msg_origin"):
+            self._mark_active(event.unified_msg_origin)
+
+    # ==================== LLM 工具 ====================
 
     @llm_tool(name="subscribe_news")
     async def subscribe_news(self, event: AstrMessageEvent) -> str:
         """订阅每日新闻推送。当用户说想要接收每日新闻、订阅新闻等意图时调用此工具。"""
+        self._mark_active_from_event(event)
         unified_id = event.unified_msg_origin
         target = self._get_target(unified_id)
+
+        # Bug6 防护
+        if _is_other(unified_id):
+            return "当前会话类型不支持新闻推送。"
 
         if not target.get("unsubscribed") and not target.get("dormant"):
             return "当前会话已经在接收每日新闻推送了，无需重复订阅。"
@@ -181,11 +263,14 @@ class Daily60sNewsPlugin(Star):
         target["dormant"] = False
         target["active_after_push"] = True
         self._save_data()
-        return f"订阅成功！将在每天 {self.push_start_time} ~ {self.push_end_time} 之间推送新闻。"
+
+        type_label = _get_type_label(unified_id)
+        return f"订阅成功！当前{type_label}将在每天 {self.push_start_time} ~ {self.push_end_time} 收到新闻推送。"
 
     @llm_tool(name="unsubscribe_news")
     async def unsubscribe_news(self, event: AstrMessageEvent) -> str:
         """取消订阅每日新闻推送。当用户说不想接收新闻、取消订阅、退订等意图时调用此工具。"""
+        self._mark_active_from_event(event)
         unified_id = event.unified_msg_origin
         target = self._get_target(unified_id)
 
@@ -199,18 +284,20 @@ class Daily60sNewsPlugin(Star):
     @llm_tool(name="check_news_subscription")
     async def check_news_subscription(self, event: AstrMessageEvent) -> str:
         """查询当前新闻推送状态。"""
+        self._mark_active_from_event(event)
         unified_id = event.unified_msg_origin
         target = self._get_target(unified_id)
+        type_label = _get_type_label(unified_id)
 
         if target.get("unsubscribed"):
-            return "当前会话已退订每日新闻。如需恢复，请告诉我。"
+            return f"当前{type_label}已退订每日新闻。如需恢复，请告诉我。"
         elif target.get("dormant"):
             return (
-                "当前会话因之前无人发言已暂停推送。"
-                "现在你说话了，明天将恢复推送。"
+                f"当前{type_label}因之前无人与bot互动已暂停推送。"
+                f"现在你说话了，明天将恢复推送。"
             )
         else:
-            return f"当前会话正在接收推送，时间为每天 {self.push_start_time} ~ {self.push_end_time}。"
+            return f"当前{type_label}正在接收推送，时间为每天 {self.push_start_time} ~ {self.push_end_time}。"
 
     # ==================== 命令 ====================
 
@@ -221,6 +308,8 @@ class Daily60sNewsPlugin(Star):
     @filter.command("新闻", alias={"早报", "news"})
     async def daily_60s_news(self, event: AstrMessageEvent, date_str=None):
         """获取60s新闻。用法: /新闻 或 /新闻 20250901"""
+        self._mark_active_from_event(event)
+
         if date_str is not None:
             try:
                 target_date = datetime.datetime.strptime(str(date_str), "%Y%m%d")
@@ -240,37 +329,64 @@ class Daily60sNewsPlugin(Star):
     @mnews.command("status")
     async def check_status(self, event: AstrMessageEvent):
         """查看插件状态（管理员）"""
+        self._mark_active_from_event(event)
         sleep_time = self._calculate_sleep_time()
         hours = int(sleep_time / 3600)
         minutes = int((sleep_time % 3600) / 60)
 
         targets = self._data.get("targets", {})
         total = len(targets)
-        active = sum(
-            1 for t in targets.values()
-            if not t.get("unsubscribed") and not t.get("dormant")
-        )
-        dormant = sum(
-            1 for t in targets.values()
-            if t.get("dormant") and not t.get("unsubscribed")
-        )
-        unsub = sum(1 for t in targets.values() if t.get("unsubscribed"))
+
+        # 分类统计
+        group_active = group_dormant = group_unsub = 0
+        private_active = private_dormant = private_unsub = 0
+        other_count = 0
+
+        for uid, t in targets.items():
+            if _is_other(uid):
+                other_count += 1
+                continue
+
+            unsub = t.get("unsubscribed", False)
+            dormant = t.get("dormant", False)
+
+            if _is_group(uid):
+                if unsub:
+                    group_unsub += 1
+                elif dormant:
+                    group_dormant += 1
+                else:
+                    group_active += 1
+            elif _is_private(uid):
+                if unsub:
+                    private_unsub += 1
+                elif dormant:
+                    private_dormant += 1
+                else:
+                    private_active += 1
 
         yield event.plain_result(
             f"📰 每日新闻插件状态\n"
             f"推送窗口: {self.push_start_time} ~ {self.push_end_time}\n"
             f"下次推送: {hours}小时{minutes}分钟后\n"
-            f"━━━━━━━━━━\n"
-            f"已知会话: {total}\n"
-            f"  ✅ 活跃(明天会推): {active}\n"
-            f"  💤 休眠(没人说话): {dormant}\n"
-            f"  ❌ 主动退订: {unsub}"
+            f"待写入活跃记录: {len(self._pending_active)} 条\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"👥 群聊 (共 {group_active + group_dormant + group_unsub})\n"
+            f"  ✅ 活跃: {group_active}\n"
+            f"  💤 休眠: {group_dormant}\n"
+            f"  ❌ 退订: {group_unsub}\n"
+            f"👤 私聊 (共 {private_active + private_dormant + private_unsub})\n"
+            f"  ✅ 活跃: {private_active}\n"
+            f"  💤 休眠: {private_dormant}\n"
+            f"  ❌ 退订: {private_unsub}\n"
+            f"❓ 其他: {other_count} (不推送)"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mnews.command("list")
     async def list_targets(self, event: AstrMessageEvent):
         """列出所有推送目标（管理员）"""
+        self._mark_active_from_event(event)
         targets = self._data.get("targets", {})
         if not targets:
             yield event.plain_result("暂无任何推送目标。")
@@ -284,41 +400,64 @@ class Daily60sNewsPlugin(Star):
                 status = "💤休眠"
             else:
                 status = "✅活跃"
-            last = info.get("last_push_date", "从未")
-            lines.append(f"{status} | 上次推送:{last}\n  {uid}")
 
-        # 防止消息过长，分段发送
+            type_label = _get_type_label(uid)
+            platform = info.get("platform", "?")
+            last = info.get("last_push_date", "从未")
+            lines.append(f"  {status} [{type_label}] {platform} | 上次:{last}\n    {uid}")
+
         text = "\n".join(lines)
         if len(text) > 2000:
-            text = text[:2000] + "\n...(内容过长已截断)"
+            text = text[:2000] + "\n...(过长已截断)"
         yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mnews.command("clean")
     async def clean_news(self, event: AstrMessageEvent):
         """清理过期新闻文件（管理员）"""
-        await self._delete_expired_news_files()
-        yield event.plain_result(f"已清理 {self.config.save_days} 天前的过期新闻文件。")
+        self._mark_active_from_event(event)
+        count = await self._delete_expired_news_files()
+        yield event.plain_result(f"已清理 {count} 个过期新闻文件。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mnews.command("push")
     async def push_news(self, event: AstrMessageEvent):
         """手动推送新闻（管理员）"""
-        await self._send_daily_news_to_all()
-        yield event.plain_result("手动推送完成。")
+        self._mark_active_from_event(event)
+        result = await self._send_daily_news_to_all()
+        yield event.plain_result(f"推送完成。{result}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @mnews.command("update_news")
     async def update_news_files(self, event: AstrMessageEvent):
         """强制重新下载今日新闻（管理员）"""
+        self._mark_active_from_event(event)
         await self._force_update_news()
         yield event.plain_result("今日新闻已重新下载。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @mnews.command("reset")
+    async def reset_target(self, event: AstrMessageEvent, target_uid: str = None):
+        """
+        重置某个目标的状态（管理员）
+        用法: /新闻管理 reset <unified_id>
+        不填则重置当前会话
+        """
+        self._mark_active_from_event(event)
+        uid = target_uid if target_uid else event.unified_msg_origin
+
+        if uid not in self._data["targets"]:
+            yield event.plain_result(f"未找到目标: {uid}")
+            return
+
+        self._data["targets"][uid] = self._make_default_target(uid, pre_active=True)
+        self._save_data()
+        yield event.plain_result(f"已重置: {uid}")
 
     # ==================== 新闻获取 ====================
 
     async def _force_update_news(self):
         image_path, _ = self._get_news_file_path()
-        # 删掉旧文件强制重下
         if _file_exists(image_path):
             os.remove(image_path)
         await self._download_news(path=image_path)
@@ -336,6 +475,19 @@ class Daily60sNewsPlugin(Star):
         if _file_exists(path):
             return path, True
         return await self._download_news(path, target_date)
+
+    async def _download_image(self, url: str, path: str, timeout: int = 10) -> Tuple[str, bool]:
+        """下载图片到本地"""
+        logger.info(f"[每日新闻] 下载: {url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    with open(path, "wb") as f:
+                        f.write(content)
+                    return path, True
+                else:
+                    raise Exception(f"HTTP {response.status}")
 
     async def _download_news(self, path: str, target_date: datetime.datetime = None):
         retries = 3
@@ -363,9 +515,8 @@ class Daily60sNewsPlugin(Star):
                             api_date = data.get(self.date_key)
                             today = datetime.datetime.now().strftime("%Y-%m-%d")
                             if today != api_date:
-                                # 回退到 vikiboss
                                 fallback = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
-                                logger.info(f"[每日新闻] 间接API日期不匹配，回退: {fallback}")
+                                logger.info(f"[每日新闻] API日期不匹配({api_date})，回退vikiboss")
                                 return await self._download_image(fallback, path, timeout)
 
                             image_url = data.get(self.img_key)
@@ -383,101 +534,126 @@ class Daily60sNewsPlugin(Star):
                 await asyncio.sleep(2)
         return "新闻获取失败: 未知错误", False
 
-    async def _download_image(self, url: str, path: str, timeout: int = 10) -> Tuple[str, bool]:
-        """下载图片到本地"""
-        logger.info(f"[每日新闻] 下载图片: {url}")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=timeout) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    with open(path, "wb") as f:
-                        f.write(content)
-                    return path, True
-                else:
-                    raise Exception(f"HTTP {response.status}")
-
     # ==================== 推送核心逻辑 ====================
 
-    async def _send_daily_news_to_all(self):
+    async def _send_daily_news_to_all(self) -> str:
         """
-        推送逻辑（群聊和私聊统一规则）：
-        
-        1. 主动退订的 → 跳过
-        2. 今天已经推过的 → 跳过
-        3. 上次推送后有人说话(active_after_push=True) → 推送
-        4. 上次推送后没人说话 → 标记休眠，跳过
-        5. 从未推送过但有人说过话 → 推送
+        推送逻辑（群聊和私聊完全统一）：
+
+        1. OtherMessage 类型 → 跳过（Bug6 防护）
+        2. 主动退订的 → 跳过
+        3. 今天已推过的 → 跳过
+        4. 上次推送后有人说话 → 推送
+        5. 上次推送后没人说话 → 标记休眠，跳过
         """
+        # 先把内存中的活跃记录刷入数据
+        self._flush_pending_active()
+
         targets = self._data.get("targets", {})
         if not targets:
             logger.info("[每日新闻] 没有任何已知目标")
-            return
+            return "没有任何已知目标。"
 
         today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
-        # 先缓存好新闻图片（只下载一次）
+        # 预下载新闻（只下载一次）
         news_path, success = await self._get_image_news()
         if not success:
             logger.error(f"[每日新闻] 获取新闻失败: {news_path}")
-            return
+            return f"获取新闻失败: {news_path}"
 
-        # 筛选要推送的目标
+        # 筛选推送目标
         push_list = []
+        skip_other = 0
+        skip_unsub = 0
+        skip_already = 0
+        skip_dormant = 0
+        newly_dormant = 0
+
         for uid, info in targets.items():
+            # Bug6: 跳过 OtherMessage
+            if _is_other(uid):
+                skip_other += 1
+                continue
+
             # 今天已推过
             if info.get("last_push_date") == today_str:
+                skip_already += 1
                 continue
 
             # 主动退订
             if info.get("unsubscribed"):
+                skip_unsub += 1
                 continue
 
-            # 检查活跃度（群聊和私聊统一逻辑）
+            # 核心判断：上次推送后有人说话吗？
             if info.get("active_after_push"):
                 push_list.append(uid)
             else:
-                # 没人说话，进入/保持休眠
                 if not info.get("dormant"):
                     info["dormant"] = True
-                    logger.info(f"[每日新闻] {uid} 无人发言，进入休眠")
+                    newly_dormant += 1
+                    type_label = _get_type_label(uid)
+                    logger.info(f"[每日新闻] [{type_label}] {uid} 无人互动，进入休眠")
+                skip_dormant += 1
 
         self._save_data()
 
-        if not push_list:
-            logger.info("[每日新闻] 没有活跃目标需要推送")
-            return
+        logger.info(
+            f"[每日新闻] 筛选结果: "
+            f"推送={len(push_list)} "
+            f"休眠={skip_dormant}(新增{newly_dormant}) "
+            f"退订={skip_unsub} "
+            f"已推={skip_already} "
+            f"其他={skip_other}"
+        )
 
-        # 计算分散推送间隔
+        if not push_list:
+            return f"没有活跃目标。休眠:{skip_dormant} 退订:{skip_unsub}"
+
+        # 分散推送
         start_h, start_m = map(int, self.push_start_time.split(":"))
         end_h, end_m = map(int, self.push_end_time.split(":"))
         window_seconds = max((end_h * 60 + end_m - start_h * 60 - start_m) * 60, 60)
 
         count = len(push_list)
         interval = window_seconds / count if count > 1 else 0
-        interval = max(interval, self.min_push_interval)  # 最小间隔
+        interval = max(interval, self.min_push_interval)
 
-        logger.info(f"[每日新闻] 开始推送，{count} 个目标，间隔 {interval:.1f}s")
+        logger.info(f"[每日新闻] 开始推送 {count} 个目标，间隔 {interval:.1f}s")
+
+        success_count = 0
+        fail_count = 0
 
         for index, uid in enumerate(push_list):
+            type_label = _get_type_label(uid)
             try:
                 chain = MessageChain().message("每日新闻播报：").file_image(news_path)
                 await self.context.send_message(uid, chain)
-                logger.info(f"[每日新闻] ✅ {uid} ({index + 1}/{count})")
 
                 # 更新状态
                 info = self._data["targets"].get(uid, {})
                 info["last_push_date"] = today_str
-                info["active_after_push"] = False  # 重置！等有人说话再变True
+                info["active_after_push"] = False  # 重置，等下次有人说话
                 info["dormant"] = False
-                self._save_data()
+
+                success_count += 1
+                logger.info(f"[每日新闻] ✅ [{type_label}] {uid} ({index + 1}/{count})")
 
                 # 分散推送
                 if index < count - 1 and interval > 0:
                     await asyncio.sleep(interval)
 
             except Exception as e:
-                logger.error(f"[每日新闻] ❌ {uid} 推送失败: {e}")
-                await asyncio.sleep(5)
+                fail_count += 1
+                logger.error(f"[每日新闻] ❌ [{type_label}] {uid} 失败: {e}")
+                await asyncio.sleep(3)
+
+        self._save_data()
+
+        result = f"成功:{success_count} 失败:{fail_count} 休眠:{skip_dormant} 退订:{skip_unsub}"
+        logger.info(f"[每日新闻] 推送完成 - {result}")
+        return result
 
     # ==================== 定时任务 ====================
 
@@ -489,10 +665,12 @@ class Daily60sNewsPlugin(Star):
             next_push += datetime.timedelta(days=1)
         return (next_push - now).total_seconds()
 
-    async def _delete_expired_news_files(self):
+    async def _delete_expired_news_files(self) -> int:
+        """删除过期新闻文件，返回删除数量"""
         save_days = self.config.get("save_days", 3)
         if save_days <= 0:
-            return
+            return 0
+        count = 0
         for filename in os.listdir(self.news_path):
             if not filename.endswith(".jpeg"):
                 continue
@@ -500,23 +678,40 @@ class Daily60sNewsPlugin(Star):
                 file_date = datetime.datetime.strptime(filename[:8], "%Y%m%d").date()
                 if (datetime.date.today() - file_date).days >= save_days:
                     os.remove(os.path.join(self.news_path, filename))
-                    logger.info(f"[每日新闻] 清理过期文件: {filename}")
+                    logger.info(f"[每日新闻] 清理: {filename}")
+                    count += 1
             except Exception:
                 continue
+        return count
 
     async def _daily_task(self):
+        """
+        定时任务，使用短间隔轮询代替长 sleep（解决 Bug8）
+        """
         while True:
             try:
                 sleep_time = self._calculate_sleep_time()
                 logger.info(f"[每日新闻] 下次推送: {sleep_time / 3600:.2f} 小时后")
-                await asyncio.sleep(sleep_time)
+
+                # 分段 sleep，每10分钟醒一次检查（解决 Bug8：sleep 漂移）
+                while sleep_time > 0:
+                    chunk = min(sleep_time, 600)  # 最多睡10分钟
+                    await asyncio.sleep(chunk)
+                    sleep_time = self._calculate_sleep_time()
+                    # 顺便刷新内存中的活跃记录
+                    self._flush_pending_active()
+                    if sleep_time <= 5:
+                        break
 
                 # 到点了
-                await self._get_image_news()  # 预下载缓存
+                logger.info("[每日新闻] 推送时间到，开始执行...")
+                await self._get_image_news()
                 await self._delete_expired_news_files()
                 await self._send_daily_news_to_all()
 
-                await asyncio.sleep(60)  # 防止同一分钟重复触发
+                # 防止同一分钟重复触发
+                await asyncio.sleep(60)
+
             except asyncio.CancelledError:
                 logger.info("[每日新闻] 定时任务已取消")
                 break
@@ -526,7 +721,9 @@ class Daily60sNewsPlugin(Star):
                 await asyncio.sleep(300)
 
     async def terminate(self):
+        """插件卸载"""
         if self._monitoring_task:
             self._monitoring_task.cancel()
+        self._flush_pending_active()
         self._save_data()
         logger.info("[每日新闻] 插件已停止")
