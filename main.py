@@ -89,7 +89,13 @@ class Daily60sNewsPlugin(Star):
             self.date_key = self.config.get("date_key", "datatime")
         elif self.news_type == "direct":
             self.img_url = self.config.direct
-
+        # 校验新闻源配置
+        if self.news_type == "indirect" and not self.config.get("indirect"):
+            logger.warning("[每日新闻] indirect API 地址未配置，自动回退到 vikiboss_api")
+            self.news_type = "vikiboss_api"
+        if self.news_type == "direct" and not self.config.get("direct"):
+            logger.warning("[每日新闻] direct 图片地址未配置，自动回退到 vikiboss_api")
+            self.news_type = "vikiboss_api"
         # 推送时间窗口
         self.push_start_time = self.config.get("push_start_time", "07:00")
         self.push_end_time = self.config.get("push_end_time", "07:15")
@@ -508,6 +514,8 @@ class Daily60sNewsPlugin(Star):
 
     async def _download_image(self, url: str, path: str, timeout=None) -> Tuple[str, bool]:
         """下载图片到本地"""
+        if not url or not url.startswith(("http://", "https://")):
+            raise Exception(f"无效的URL: '{url}'")
         if timeout is None:
             timeout = aiohttp.ClientTimeout(total=30)
         elif isinstance(timeout, (int, float)):
@@ -537,15 +545,19 @@ class Daily60sNewsPlugin(Star):
                     return await self._download_image(url, path, timeout)
 
                 elif self.news_type == "indirect":
-                    # indirect API 只能获取今天的新闻
-                    # 如果请求的是历史日期，直接走 vikiboss 回退
                     today = datetime.datetime.now().strftime("%Y-%m-%d")
-                    if date != today:
+
+                    # indirect API 为空 或 请求历史日期 → 直接走 vikiboss
+                    if not self.api or date != today:
                         fallback = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
-                        logger.info(f"[每日新闻] 请求历史日期 {date}，直接使用vikiboss")
+                        if not self.api:
+                            logger.info(f"[每日新闻] indirect API 未配置，使用vikiboss: {fallback}")
+                        else:
+                            logger.info(f"[每日新闻] 请求历史日期 {date}，使用vikiboss: {fallback}")
                         return await self._download_image(fallback, path, timeout)
 
                     url = self.api
+                    logger.info(f"[每日新闻] 使用indirect API: {url}")
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url, timeout=timeout) as response:
                             if response.status != 200:
