@@ -506,11 +506,15 @@ class Daily60sNewsPlugin(Star):
             return path, True
         return await self._download_news(path, target_date)
 
-    async def _download_image(self, url: str, path: str, timeout: int = 10) -> Tuple[str, bool]:
+    async def _download_image(self, url: str, path: str, timeout=None) -> Tuple[str, bool]:
         """下载图片到本地"""
+        if timeout is None:
+            timeout = aiohttp.ClientTimeout(total=30)
+        elif isinstance(timeout, (int, float)):
+            timeout = aiohttp.ClientTimeout(total=timeout)
         logger.info(f"[每日新闻] 下载: {url}")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=timeout) as response:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
                 if response.status == 200:
                     content = await response.read()
                     with open(path, "wb") as f:
@@ -521,7 +525,7 @@ class Daily60sNewsPlugin(Star):
 
     async def _download_news(self, path: str, target_date: datetime.datetime = None):
         retries = 3
-        timeout = 10
+        timeout = aiohttp.ClientTimeout(total=30)
         if target_date is None:
             target_date = datetime.datetime.now()
         date = target_date.strftime("%Y-%m-%d")
@@ -533,6 +537,14 @@ class Daily60sNewsPlugin(Star):
                     return await self._download_image(url, path, timeout)
 
                 elif self.news_type == "indirect":
+                    # indirect API 只能获取今天的新闻
+                    # 如果请求的是历史日期，直接走 vikiboss 回退
+                    today = datetime.datetime.now().strftime("%Y-%m-%d")
+                    if date != today:
+                        fallback = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
+                        logger.info(f"[每日新闻] 请求历史日期 {date}，直接使用vikiboss")
+                        return await self._download_image(fallback, path, timeout)
+
                     url = self.api
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url, timeout=timeout) as response:
@@ -543,7 +555,6 @@ class Daily60sNewsPlugin(Star):
                                 raise Exception(f"API错误: {data.get('msg', '未知')}")
 
                             api_date = data.get(self.date_key)
-                            today = datetime.datetime.now().strftime("%Y-%m-%d")
                             if today != api_date:
                                 fallback = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
                                 logger.info(f"[每日新闻] API日期不匹配({api_date})，回退vikiboss")
@@ -558,9 +569,10 @@ class Daily60sNewsPlugin(Star):
                     return await self._download_image(self.img_url, path, timeout)
 
             except Exception as e:
-                logger.error(f"[每日新闻] 下载失败 {attempt + 1}/{retries}: {e}")
+                err_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                logger.error(f"[每日新闻] 下载失败 {attempt + 1}/{retries}: {err_msg}")
                 if attempt == retries - 1:
-                    return f"新闻获取失败: {e}", False
+                    return f"新闻获取失败: {err_msg}", False
                 await asyncio.sleep(2)
         return "新闻获取失败: 未知错误", False
 
