@@ -712,12 +712,29 @@ class Daily60sNewsPlugin(Star):
     # ==================== 定时任务 ====================
 
     def _calculate_sleep_time(self) -> float:
+        """
+        计算距离下次推送的秒数。
+        如果当前时间在推送窗口内（start ~ end），返回 0（立即推送）。
+        如果已过推送窗口，返回到明天 start 的秒数。
+        """
         now = datetime.datetime.now()
-        hour, minute = map(int, self.push_start_time.split(":"))
-        next_push = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if next_push <= now:
-            next_push += datetime.timedelta(days=1)
-        return (next_push - now).total_seconds()
+        start_h, start_m = map(int, self.push_start_time.split(":"))
+        end_h, end_m = map(int, self.push_end_time.split(":"))
+
+        today_start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        today_end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+
+        # 还没到推送时间
+        if now < today_start:
+            return (today_start - now).total_seconds()
+
+        # 在推送窗口内 → 立即推送
+        if now <= today_end:
+            return 0
+
+        # 已过推送窗口 → 明天
+        tomorrow_start = today_start + datetime.timedelta(days=1)
+        return (tomorrow_start - now).total_seconds()
 
     async def _delete_expired_news_files(self) -> int:
         """删除过期新闻文件，返回删除数量"""
@@ -740,31 +757,49 @@ class Daily60sNewsPlugin(Star):
 
     async def _daily_task(self):
         """
-        定时任务，使用短间隔轮询代替长 sleep（解决 Bug8）
+        定时任务主循环。
+        每60秒检查一次是否到了推送时间，到了就推送。
+        用 last_task_date 防止同一天重复推送。
         """
+        last_task_date = ""  # 记录上次执行推送的日期
+
         while True:
             try:
                 sleep_time = self._calculate_sleep_time()
-                logger.info(f"[每日新闻] 下次推送: {sleep_time / 3600:.2f} 小时后")
 
-                # 分段 sleep，每10分钟醒一次检查（解决 Bug8：sleep 漂移）
-                while sleep_time > 0:
-                    chunk = min(sleep_time, 600)  # 最多睡10分钟
-                    await asyncio.sleep(chunk)
-                    sleep_time = self._calculate_sleep_time()
-                    # 顺便刷新内存中的活跃记录
+                if sleep_time > 120:
+                    # 离推送时间还早，长睡一会
+                    # 每30分钟醒来刷一次活跃记录
+                    nap = min(sleep_time - 60, 1800)
+                    logger.info(f"[每日新闻] 下次推送: {sleep_time / 3600:.2f} 小时后，休眠 {nap:.0f}s")
+                    await asyncio.sleep(nap)
                     self._flush_pending_active()
-                    if sleep_time <= 5:
-                        break
+                    continue
 
-                # 到点了
-                logger.info("[每日新闻] 推送时间到，开始执行...")
-                await self._get_image_news()
+                if sleep_time > 0:
+                    # 快到了，精确等待
+                    logger.info(f"[每日新闻] 即将推送，等待 {sleep_time:.0f}s")
+                    await asyncio.sleep(sleep_time)
+
+                # === 到推送时间了 ===
+                today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                if today_str == last_task_date:
+                    # 今天已经推过了，等明天
+                    logger.debug("[每日新闻] 今天已执行过推送，跳过")
+                    await asyncio.sleep(60)
+                    continue
+
+                logger.info("[每日新闻] ⏰ 推送时间到，开始执行...")
+                last_task_date = today_str
+
+                # 执行推送流程
+                await self._get_image_news()        # 预下载缓存
                 await self._delete_expired_news_files()
-                await self._send_daily_news_to_all()
+                result = await self._send_daily_news_to_all()
+                logger.info(f"[每日新闻] 今日推送完成: {result}")
 
-                # 防止同一分钟重复触发
-                await asyncio.sleep(60)
+                # 推完后等2分钟再进入下一轮循环
+                await asyncio.sleep(120)
 
             except asyncio.CancelledError:
                 logger.info("[每日新闻] 定时任务已取消")
