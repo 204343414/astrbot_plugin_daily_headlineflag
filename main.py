@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 import os
 import time
 import traceback
@@ -70,7 +71,7 @@ def _get_type_label(unified_id: str) -> str:
     "每日60s读懂世界",
     "eaton",
     "AstrBot 每日60s新闻插件。自动检测活跃会话推送，群聊私聊通用。",
-    "0.0.5",
+    "0.0.6",
 )
 class Daily60sNewsPlugin(Star):
 
@@ -101,6 +102,10 @@ class Daily60sNewsPlugin(Star):
         self.push_end_time = self.config.get("push_end_time", "07:15")
         self.push_time = self.config.get("push_time", self.push_start_time)
         self.min_push_interval = self.config.get("min_push_interval", 5.0)
+
+        # 新闻更新检测
+        self.enable_news_update_check = self.config.get("enable_news_update_check", True)
+        self.news_check_interval = self.config.get("news_check_interval", 300)
 
         # ========= 核心数据 =========
         self.data_file = SAVED_NEWS_DIR / "news_push_data.json"
@@ -588,6 +593,107 @@ class Daily60sNewsPlugin(Star):
                 await asyncio.sleep(2)
         return "新闻获取失败: 未知错误", False
 
+    # ==================== 新闻更新检测 ====================
+
+    def _get_file_hash(self, file_path: str) -> str:
+        """计算文件的 MD5 哈希值"""
+        if not _file_exists(file_path):
+            return ""
+        md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                md5.update(chunk)
+        return md5.hexdigest()
+
+    def _is_news_updated(self) -> bool:
+        """
+        检测今天的新闻是否与昨天不同（即是否已更新）。
+        - 昨天的新闻文件不存在 → 视为已更新（首次推送场景）
+        - 今天和昨天哈希相同 → 未更新
+        - 今天和昨天哈希不同 → 已更新
+        """
+        today_path, _ = self._get_news_file_path()
+        yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+        yesterday_path, _ = self._get_news_file_path(yesterday)
+
+        # 今天新闻还没下载
+        if not _file_exists(today_path):
+            return False
+
+        # 昨天新闻不存在 → 视为更新
+        if not _file_exists(yesterday_path):
+            logger.info("[每日新闻] 昨日新闻文件不存在，视为已更新")
+            return True
+
+        today_hash = self._get_file_hash(today_path)
+        yesterday_hash = self._get_file_hash(yesterday_path)
+
+        if today_hash == yesterday_hash:
+            logger.info(f"[每日新闻] 今日新闻与昨日相同 (hash={today_hash[:12]})，尚未更新")
+            return False
+
+        logger.info(f"[每日新闻] 今日新闻已更新 (today={today_hash[:12]} vs yesterday={yesterday_hash[:12]})")
+        return True
+
+    def _is_past_push_window(self) -> bool:
+        """检查当前时间是否已过推送窗口结束时间"""
+        now = datetime.datetime.now()
+        end_h, end_m = map(int, self.push_end_time.split(":"))
+        today_end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+        return now > today_end
+
+    async def _try_push_with_update_check(self, today_str: str) -> bool:
+        """
+        在推送窗口内反复检测新闻是否已更新，更新后才推送。
+        返回 True 表示已推送，False 表示新闻始终未更新、今日跳过。
+        """
+        start_h, start_m = map(int, self.push_start_time.split(":"))
+        end_h, end_m = map(int, self.push_end_time.split(":"))
+        window_seconds = max((end_h * 60 + end_m - start_h * 60 - start_m) * 60, 60)
+        max_retries = max(int(window_seconds / self.news_check_interval), 1) + 1
+
+        for attempt in range(max_retries):
+            # 检查是否还在推送窗口内
+            if self._is_past_push_window():
+                logger.info("[每日新闻] 推送窗口已结束，今日新闻未更新，跳过推送")
+                return False
+
+            # 第二次及以后的检测，先删除缓存再重新下载
+            if attempt > 0:
+                today_path, _ = self._get_news_file_path()
+                if _file_exists(today_path):
+                    os.remove(today_path)
+
+            # 下载今天的新闻
+            news_path, success = await self._get_image_news()
+            if not success:
+                logger.warning(f"[每日新闻] 第{attempt + 1}次检测：新闻下载失败，等待重试")
+                await asyncio.sleep(self.news_check_interval)
+                continue
+
+            # 比较今天的新闻和昨天的是否相同
+            if self._is_news_updated():
+                logger.info(f"[每日新闻] 新闻已更新，开始推送 (第{attempt + 1}次检测)")
+                await self._delete_expired_news_files()
+                result = await self._send_daily_news_to_all()
+                logger.info(f"[每日新闻] 今日推送完成: {result}")
+                return True
+
+            # 新闻未更新，等待后重试
+            if attempt < max_retries - 1:
+                remaining = int((datetime.datetime.now().replace(
+                    hour=end_h, minute=end_m, second=0
+                ) - datetime.datetime.now()).total_seconds())
+                wait_time = min(self.news_check_interval, max(remaining, 30))
+                logger.info(
+                    f"[每日新闻] 新闻尚未更新，{wait_time}秒后重试 "
+                    f"(第{attempt + 1}/{max_retries}次)"
+                )
+                await asyncio.sleep(wait_time)
+
+        logger.info("[每日新闻] 达到最大检测次数，今日新闻未更新，跳过推送")
+        return False
+
     # ==================== 推送核心逻辑 ====================
 
     async def _send_daily_news_to_all(self) -> str:
@@ -760,6 +866,9 @@ class Daily60sNewsPlugin(Star):
         定时任务主循环。
         每60秒检查一次是否到了推送时间，到了就推送。
         用 last_task_date 防止同一天重复推送。
+
+        新增逻辑：启用新闻更新检测时，会在推送窗口内反复检测
+        今日新闻是否与昨日不同，只有更新了才推送。
         """
         last_task_date = ""  # 记录上次执行推送的日期
 
@@ -789,14 +898,21 @@ class Daily60sNewsPlugin(Star):
                     await asyncio.sleep(60)
                     continue
 
-                logger.info("[每日新闻] ⏰ 推送时间到，开始执行...")
+                logger.info("[每日新闻] 推送窗口开始，准备执行...")
                 last_task_date = today_str
 
-                # 执行推送流程
-                await self._get_image_news()        # 预下载缓存
-                await self._delete_expired_news_files()
-                result = await self._send_daily_news_to_all()
-                logger.info(f"[每日新闻] 今日推送完成: {result}")
+                if self.enable_news_update_check:
+                    # 启用新闻更新检测：在窗口内反复检测，更新后才推送
+                    logger.info("[每日新闻] 启用新闻更新检测模式")
+                    pushed = await self._try_push_with_update_check(today_str)
+                    if not pushed:
+                        logger.info("[每日新闻] 今日新闻未更新，已跳过推送")
+                else:
+                    # 不启用检测：直接推送（原有逻辑）
+                    await self._get_image_news()        # 预下载缓存
+                    await self._delete_expired_news_files()
+                    result = await self._send_daily_news_to_all()
+                    logger.info(f"[每日新闻] 今日推送完成: {result}")
 
                 # 推完后等2分钟再进入下一轮循环
                 await asyncio.sleep(120)
