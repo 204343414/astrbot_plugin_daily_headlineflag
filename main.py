@@ -70,8 +70,8 @@ def _get_type_label(unified_id: str) -> str:
 @register(
     "每日60s读懂世界",
     "eaton",
-    "AstrBot 每日60s新闻插件。自动检测活跃会话推送，群聊私聊通用。",
-    "0.0.6",
+    "AstrBot 每日60s新闻插件。自动检测活跃会话推送，默认仅推送群聊。",
+    "0.0.7",
 )
 class Daily60sNewsPlugin(Star):
 
@@ -102,6 +102,9 @@ class Daily60sNewsPlugin(Star):
         self.push_end_time = self.config.get("push_end_time", "07:15")
         self.push_time = self.config.get("push_time", self.push_start_time)
         self.min_push_interval = self.config.get("min_push_interval", 5.0)
+
+        # 只推送到群聊，不推送私聊（私聊仍可正常互动/触发活跃检测，只是不推送新闻）
+        self.group_only_push = self.config.get("group_only_push", True)
 
         # 新闻更新检测
         self.enable_news_update_check = self.config.get("enable_news_update_check", True)
@@ -296,6 +299,10 @@ class Daily60sNewsPlugin(Star):
         if _is_other(unified_id):
             return "当前会话类型不支持新闻推送。"
 
+        # 只推群聊模式下，私聊无法订阅推送
+        if self.group_only_push and _is_private(unified_id):
+            return "当前插件设置为仅推送群聊新闻，私聊不支持订阅。"
+
         if not target.get("unsubscribed") and not target.get("dormant"):
             return "当前会话已经在接收每日新闻推送了，无需重复订阅。"
 
@@ -329,7 +336,9 @@ class Daily60sNewsPlugin(Star):
         target = self._get_target(unified_id)
         type_label = _get_type_label(unified_id)
 
-        if target.get("unsubscribed"):
+        if self.group_only_push and _is_private(unified_id):
+            return "当前插件设置为仅推送群聊新闻，私聊不会收到推送。"
+        elif target.get("unsubscribed"):
             return f"当前{type_label}已退订每日新闻。如需恢复，请告诉我。"
         elif target.get("dormant"):
             return (
@@ -405,9 +414,11 @@ class Daily60sNewsPlugin(Star):
                 else:
                     private_active += 1
 
+        push_mode = "仅群聊" if self.group_only_push else "群聊+私聊"
         yield event.plain_result(
             f"📰 每日新闻插件状态\n"
             f"推送窗口: {self.push_start_time} ~ {self.push_end_time}\n"
+            f"推送范围: {push_mode}\n"
             f"下次推送: {hours}小时{minutes}分钟后\n"
             f"待写入活跃记录: {len(self._pending_active)} 条\n"
             f"━━━━━━━━━━━━━━\n"
@@ -415,7 +426,8 @@ class Daily60sNewsPlugin(Star):
             f"  ✅ 活跃: {group_active}\n"
             f"  💤 休眠: {group_dormant}\n"
             f"  ❌ 退订: {group_unsub}\n"
-            f"👤 私聊 (共 {private_active + private_dormant + private_unsub})\n"
+            f"👤 私聊 (共 {private_active + private_dormant + private_unsub})"
+            f"{'（不推送）' if self.group_only_push else ''}\n"
             f"  ✅ 活跃: {private_active}\n"
             f"  💤 休眠: {private_dormant}\n"
             f"  ❌ 退订: {private_unsub}\n"
@@ -434,7 +446,9 @@ class Daily60sNewsPlugin(Star):
 
         lines = ["📋 推送目标列表：\n"]
         for uid, info in targets.items():
-            if info.get("unsubscribed"):
+            if self.group_only_push and _is_private(uid):
+                status = "🚫不推(私聊)"
+            elif info.get("unsubscribed"):
                 status = "❌退订"
             elif info.get("dormant"):
                 status = "💤休眠"
@@ -698,13 +712,17 @@ class Daily60sNewsPlugin(Star):
 
     async def _send_daily_news_to_all(self) -> str:
         """
-        推送逻辑（群聊和私聊完全统一）：
+        推送逻辑：
 
         1. OtherMessage 类型 → 跳过（Bug6 防护）
-        2. 主动退订的 → 跳过
-        3. 今天已推过的 → 跳过
-        4. 上次推送后有人说话 → 推送
-        5. 上次推送后没人说话 → 标记休眠，跳过
+        2. group_only_push=True（默认）时，私聊 → 跳过，只推群聊
+        3. 主动退订的 → 跳过
+        4. 今天已推过的 → 跳过
+        5. 上次推送后有人说话 → 推送
+        6. 上次推送后没人说话 → 标记休眠，跳过
+
+        注：私聊即使不推送新闻，仍然正常参与活跃检测/订阅命令等其他逻辑，
+        只是在实际发送新闻这一步被过滤掉。
         """
         # 先把内存中的活跃记录刷入数据
         self._flush_pending_active()
@@ -725,6 +743,7 @@ class Daily60sNewsPlugin(Star):
         # 筛选推送目标
         push_list = []
         skip_other = 0
+        skip_private = 0
         skip_unsub = 0
         skip_already = 0
         skip_dormant = 0
@@ -734,6 +753,11 @@ class Daily60sNewsPlugin(Star):
             # Bug6: 跳过 OtherMessage
             if _is_other(uid):
                 skip_other += 1
+                continue
+
+            # 只推群聊：跳过私聊（不影响私聊的活跃检测/退订等其他功能）
+            if self.group_only_push and _is_private(uid):
+                skip_private += 1
                 continue
 
             # 今天已推过
@@ -765,11 +789,12 @@ class Daily60sNewsPlugin(Star):
             f"休眠={skip_dormant}(新增{newly_dormant}) "
             f"退订={skip_unsub} "
             f"已推={skip_already} "
+            f"私聊跳过={skip_private} "
             f"其他={skip_other}"
         )
 
         if not push_list:
-            return f"没有活跃目标。休眠:{skip_dormant} 退订:{skip_unsub}"
+            return f"没有活跃目标。休眠:{skip_dormant} 退订:{skip_unsub} 私聊跳过:{skip_private}"
 
         # 分散推送
         start_h, start_m = map(int, self.push_start_time.split(":"))

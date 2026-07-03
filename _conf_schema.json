@@ -53,5 +53,10 @@
     "description": "每个目标之间的最小推送间隔（秒），防风控",
     "type": "float",
     "default": 5.0
+  },
+  "group_only_push": {
+    "description": "只推送到群聊，不推送私聊（私聊仍正常参与活跃检测/订阅等功能，只是不会收到新闻）",
+    "type": "bool",
+    "default": true
   }
 }
