@@ -71,7 +71,7 @@ def _get_type_label(unified_id: str) -> str:
     "每日60s读懂世界",
     "eaton",
     "AstrBot 每日60s新闻插件。自动检测活跃会话推送，默认仅推送群聊。",
-    "0.0.7",
+    "0.0.8",
 )
 class Daily60sNewsPlugin(Star):
 
@@ -274,14 +274,20 @@ class Daily60sNewsPlugin(Star):
             return
         if self._is_bot_message(event):
             return
-        self._mark_active(event.unified_msg_origin)
+        unified_id = event.unified_msg_origin
+        # 仅推群聊模式下，私聊消息不记录活跃状态（反正也不会被推送）
+        # 这样可以避免陌生人私聊刷屏时产生大量无意义的磁盘写入 / 数据膨胀
+        if self.group_only_push and _is_private(unified_id):
+            return
+        self._mark_active(unified_id)
 
     @filter.regex(r"[\s\S]*")
     async def _catch_all_messages(self, event: AstrMessageEvent):
         """
         捕获所有消息用于记录活跃度。
         不 yield 任何内容 = 不产生回复 = 不阻断其他插件处理。
-        群聊有人说话、私聊有人找 bot，都会被记录。
+        群聊有人说话会被记录；私聊是否记录取决于 group_only_push
+        （开启时私聊不记录，避免无意义的磁盘写入/数据膨胀）。
         """
         self._mark_active_from_event(event)
         # 关键：不 yield 任何东西，消息继续流转给其他 handler
@@ -293,16 +299,16 @@ class Daily60sNewsPlugin(Star):
         """订阅每日新闻推送。当用户说想要接收每日新闻、订阅新闻等意图时调用此工具。"""
         self._mark_active_from_event(event)
         unified_id = event.unified_msg_origin
-        target = self._get_target(unified_id)
 
         # Bug6 防护
         if _is_other(unified_id):
             return "当前会话类型不支持新闻推送。"
 
-        # 只推群聊模式下，私聊无法订阅推送
+        # 只推群聊模式下，私聊无法订阅推送。提前返回，避免为私聊创建持久化记录
         if self.group_only_push and _is_private(unified_id):
             return "当前插件设置为仅推送群聊新闻，私聊不支持订阅。"
 
+        target = self._get_target(unified_id)
         if not target.get("unsubscribed") and not target.get("dormant"):
             return "当前会话已经在接收每日新闻推送了，无需重复订阅。"
 
@@ -319,8 +325,12 @@ class Daily60sNewsPlugin(Star):
         """取消订阅每日新闻推送。当用户说不想接收新闻、取消订阅、退订等意图时调用此工具。"""
         self._mark_active_from_event(event)
         unified_id = event.unified_msg_origin
-        target = self._get_target(unified_id)
 
+        # 只推群聊模式下，私聊本来就不会收到推送，无需创建记录/退订
+        if self.group_only_push and _is_private(unified_id):
+            return "当前插件设置为仅推送群聊新闻，私聊本来就不会收到推送，无需退订。"
+
+        target = self._get_target(unified_id)
         if target.get("unsubscribed"):
             return "当前会话已经取消了每日新闻推送。"
 
@@ -333,12 +343,14 @@ class Daily60sNewsPlugin(Star):
         """查询当前新闻推送状态。"""
         self._mark_active_from_event(event)
         unified_id = event.unified_msg_origin
-        target = self._get_target(unified_id)
         type_label = _get_type_label(unified_id)
 
+        # 提前判断，避免为私聊创建持久化记录
         if self.group_only_push and _is_private(unified_id):
             return "当前插件设置为仅推送群聊新闻，私聊不会收到推送。"
-        elif target.get("unsubscribed"):
+
+        target = self._get_target(unified_id)
+        if target.get("unsubscribed"):
             return f"当前{type_label}已退订每日新闻。如需恢复，请告诉我。"
         elif target.get("dormant"):
             return (

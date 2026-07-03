@@ -1,6 +1,6 @@
 name: astrbot_plugin_daily_headlineflag
 display_name: "每日60s新闻"
 desc: "每日60s读懂世界 - 自动检测活跃会话推送新闻，默认仅推送群聊（可配置），有人说话才推送，没人说话自动休眠。"
-version: v0.0.7
+version: v0.0.8
 author: ハ·七
 repo: https://github.com/204343414/astrbot_plugin_daily_headlineflag
