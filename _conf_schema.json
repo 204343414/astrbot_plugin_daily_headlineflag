@@ -1,62 +1,17 @@
 {
-  "news_type": {
-    "description": "新闻获取方式: vikiboss_api / indirect / direct",
-    "type": "string",
-    "default": "indirect"
-  },
-  "vikiboss_api": {
-    "description": "vikiboss API 地址（news_type=vikiboss_api 时使用）",
-    "type": "string",
-    "default": "https://60s-api.viki.moe/v2/60s"
-  },
-  "indirect": {
-    "description": "间接API地址（news_type=indirect 时使用）",
-    "type": "string",
-    "default": ""
-  },
-  "img_key": {
-    "description": "间接API返回JSON中图片URL的键名",
-    "type": "string",
-    "default": "imageUrl"
-  },
-  "date_key": {
-    "description": "间接API返回JSON中日期的键名",
-    "type": "string",
-    "default": "datatime"
-  },
-  "direct": {
-    "description": "直接图片URL（news_type=direct 时使用）",
-    "type": "string",
-    "default": ""
-  },
-  "push_start_time": {
-    "description": "推送时间窗口开始（HH:MM），到点开始依次推送",
-    "type": "string",
-    "default": "07:00"
-  },
-  "push_end_time": {
-    "description": "推送时间窗口结束（HH:MM），所有推送在此之前完成",
-    "type": "string",
-    "default": "07:15"
-  },
-  "push_time": {
-    "description": "（兼容旧版）推送时间，新版请用 push_start_time",
-    "type": "string",
-    "default": "07:00"
-  },
-  "save_days": {
-    "description": "新闻图片本地保留天数",
+  "check_interval_seconds": {
+    "description": "全天新闻更新检查间隔（秒），最低60，默认300=5分钟",
     "type": "int",
-    "default": 3
+    "default": 300
   },
-  "min_push_interval": {
-    "description": "每个目标之间的最小推送间隔（秒），防风控",
+  "send_interval_seconds": {
+    "description": "向不同QQ群主动推送之间的间隔（秒），最低3，默认5秒，为Bot总QPM保留余量",
     "type": "float",
     "default": 5.0
   },
-  "group_only_push": {
-    "description": "只推送到群聊，不推送私聊（私聊仍正常参与活跃检测/订阅等功能，只是不会收到新闻）",
-    "type": "bool",
-    "default": true
+  "save_days": {
+    "description": "新闻图片本地保留天数，至少2天以便比较昨日和今日内容",
+    "type": "int",
+    "default": 3
   }
 }
