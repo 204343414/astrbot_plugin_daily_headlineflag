@@ -4,7 +4,6 @@ import datetime as dt
 import hashlib
 import json
 import os
-import shutil
 import time
 from pathlib import Path
 
@@ -94,28 +93,7 @@ class DailyHeadlineFlagPlugin(Star):
                         state["groups"] = {}
             except Exception as exc:
                 logger.error("[头条新闻] 状态文件读取失败，保留原文件并使用空内存状态: %s", exc)
-        self._import_legacy_groups(state)
         return state
-
-    def _import_legacy_groups(self, state: dict) -> None:
-        """只迁移旧插件已观察到的群会话，不迁移活跃/休眠/退订逻辑。"""
-        legacy = Path("data/plugin_data/astrbot_plugin_daily_60s_news/news/news_push_data.json").resolve()
-        marker = self.data_dir / ".legacy_groups_imported"
-        if marker.exists() or not legacy.exists():
-            return
-        try:
-            old = json.loads(legacy.read_text(encoding="utf-8"))
-            count = 0
-            for origin in old.get("targets", {}):
-                if "GroupMessage" not in str(origin):
-                    continue
-                state["groups"].setdefault(str(origin), self._new_group_state())
-                count += 1
-            marker.write_text(str(int(time.time())), encoding="utf-8")
-            if count:
-                logger.info("[头条新闻] 从旧插件导入 %d 个群会话，平台类型将在发送前校验", count)
-        except Exception as exc:
-            logger.warning("[头条新闻] 旧群会话导入失败，不影响新群自动发现: %s", exc)
 
     @staticmethod
     def _new_group_state() -> dict:
@@ -162,6 +140,24 @@ class DailyHeadlineFlagPlugin(Star):
         platform_id = origin.split(":", 1)[0]
         platform = self._loaded_platforms().get(platform_id)
         return bool(platform and platform.get("name") == "qq_official")
+
+    def _prune_non_official_groups(self) -> int:
+        """仅在已确认加载 QQ Official 平台时清除旧平台历史目标。"""
+        platforms = self._loaded_platforms()
+        official_ids = {platform_id for platform_id, data in platforms.items() if data.get("name") == "qq_official"}
+        if not official_ids:
+            return 0
+        removed = 0
+        for origin in list(self.state["groups"]):
+            platform_id = str(origin).split(":", 1)[0]
+            if "GroupMessage" not in str(origin) or platform_id not in official_ids:
+                del self.state["groups"][origin]
+                self._ready_groups.discard(origin)
+                removed += 1
+        if removed:
+            self._save_state()
+            logger.warning("[头条新闻] 已清理 %d 个非当前 QQ 官方平台的历史群目标", removed)
+        return removed
 
     def _group_ready(self, origin: str) -> bool:
         if origin in self._ready_groups:
@@ -301,6 +297,7 @@ class DailyHeadlineFlagPlugin(Star):
                 await asyncio.sleep(self.send_interval)
 
     async def _check_once(self) -> None:
+        self._prune_non_official_groups()
         detected = await self._detect_current_news()
         if detected:
             await self._push_news(*detected)
@@ -348,6 +345,7 @@ class DailyHeadlineFlagPlugin(Star):
     @filter.command("新闻状态")
     async def status_command(self, event: AstrMessageEvent):
         """查看新闻监控和 QQ 官方群投递状态。"""
+        self._prune_non_official_groups()
         success = sum(1 for group in self.state["groups"].values() if group.get("last_delivery") == "SUCCESS")
         failed = sum(1 for group in self.state["groups"].values() if group.get("last_delivery") == "FAILED")
         ready = sum(1 for origin in self.state["groups"] if self._group_ready(origin))
