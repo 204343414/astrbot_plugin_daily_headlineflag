@@ -1,971 +1,376 @@
 import asyncio
-import datetime
+import builtins
+import datetime as dt
 import hashlib
+import json
 import os
+import shutil
 import time
-import traceback
 from pathlib import Path
-from typing import Tuple
 
 import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.event.filter import llm_tool
-import json
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.core.message.message_event_result import MessageChain
 
-SAVED_NEWS_DIR = Path("data", "plugin_data", "astrbot_plugin_daily_60s_news", "news")
-SAVED_NEWS_DIR.mkdir(parents=True, exist_ok=True)
+PLUGIN_NAME = "astrbot_plugin_daily_headlineflag"
+API_URL = "https://60s-api.viki.moe/v2/60s"
 
-
-def _file_exists(path: str) -> bool:
-    return os.path.exists(path)
-
-
-def _parse_msg_origin(unified_id: str) -> dict:
-    """
-    解析 unified_msg_origin，提取平台、消息类型、ID
-    格式: 前缀:中缀:后缀
-    例: aiocqhttp:GroupMessage:987654321
-        wechatpadpro:GroupMessage:123456789@chatroom
-    """
-    parts = unified_id.split(":", 2)  # 最多分3段（后缀可能包含冒号）
-    result = {
-        "platform": parts[0] if len(parts) > 0 else "unknown",
-        "msg_type": parts[1] if len(parts) > 1 else "unknown",
-        "target_id": parts[2] if len(parts) > 2 else "unknown",
+if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
+    builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME = {
+        "generation": 0,
+        "instance": None,
+        "task": None,
     }
-    return result
-
-
-def _is_group(unified_id: str) -> bool:
-    """判断是否为群聊"""
-    return "GroupMessage" in unified_id
-
-
-def _is_private(unified_id: str) -> bool:
-    """判断是否为私聊"""
-    return "FriendMessage" in unified_id
-
-
-def _is_other(unified_id: str) -> bool:
-    """判断是否为其他类型"""
-    return "OtherMessage" in unified_id
-
-
-def _get_type_label(unified_id: str) -> str:
-    """获取可读的类型标签"""
-    if _is_group(unified_id):
-        return "群聊"
-    elif _is_private(unified_id):
-        return "私聊"
-    elif _is_other(unified_id):
-        return "其他"
-    else:
-        return "未知"
 
 
 @register(
-    "每日60s读懂世界",
-    "eaton",
-    "AstrBot 每日60s新闻插件。自动检测活跃会话推送，默认仅推送群聊。",
-    "0.0.8",
+    "astrbot_plugin_daily_headlineflag",
+    "ハ·七",
+    "QQ官方群每日60秒新闻：检测今日新闻更新后向所有已观察群主动推送一次",
+    "1.0.0",
+    "",
 )
-class Daily60sNewsPlugin(Star):
-
+class DailyHeadlineFlagPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.context = context
         self.config = config
+        self.check_interval = max(int(config.get("check_interval_seconds", 300)), 60)
+        self.send_interval = max(float(config.get("send_interval_seconds", 5.0)), 3.0)
+        self.save_days = max(int(config.get("save_days", 3)), 2)
 
-        # 新闻源配置
-        self.news_type = config.get("news_type", "indirect")
-        self.news_path = SAVED_NEWS_DIR
-        if self.news_type == "vikiboss_api":
-            self.api = self.config.vikiboss_api
-        elif self.news_type == "indirect":
-            self.api = self.config.indirect
-            self.img_key = self.config.get("img_key", "imageUrl")
-            self.date_key = self.config.get("date_key", "datatime")
-        elif self.news_type == "direct":
-            self.img_url = self.config.direct
-        # 校验新闻源配置
-        if self.news_type == "indirect" and not self.config.get("indirect"):
-            logger.warning("[每日新闻] indirect API 地址未配置，自动回退到 vikiboss_api")
-            self.news_type = "vikiboss_api"
-        if self.news_type == "direct" and not self.config.get("direct"):
-            logger.warning("[每日新闻] direct 图片地址未配置，自动回退到 vikiboss_api")
-            self.news_type = "vikiboss_api"
-        # 推送时间窗口
-        self.push_start_time = self.config.get("push_start_time", "07:00")
-        self.push_end_time = self.config.get("push_end_time", "07:15")
-        self.push_time = self.config.get("push_time", self.push_start_time)
-        self.min_push_interval = self.config.get("min_push_interval", 5.0)
+        self.data_dir = self._resolve_data_dir()
+        self.news_dir = self.data_dir / "news"
+        self.news_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = self.data_dir / "state.json"
+        self.state = self._load_state()
+        self._save_state()
+        self._ready_groups: set[str] = set()
 
-        # 只推送到群聊，不推送私聊（私聊仍可正常互动/触发活跃检测，只是不推送新闻）
-        self.group_only_push = self.config.get("group_only_push", True)
+        runtime = builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME
+        old_task = runtime.get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+            logger.warning("[头条新闻] 已取消跨重载残留任务 id=%s", id(old_task))
+        runtime["generation"] = int(runtime.get("generation", 0)) + 1
+        self._generation = runtime["generation"]
+        runtime["instance"] = self
+        self._task = asyncio.create_task(self._monitor_loop())
+        runtime["task"] = self._task
 
-        # 新闻更新检测
-        self.enable_news_update_check = self.config.get("enable_news_update_check", True)
-        self.news_check_interval = self.config.get("news_check_interval", 300)
+        logger.info("[头条新闻] 数据目录: %s", self.data_dir)
+        logger.info("[头条新闻] 已登记 QQ 官方群: %d", len(self.state["groups"]))
+        logger.info("[头条新闻] 全天每 %d 秒检查新闻更新", self.check_interval)
 
-        # ========= 核心数据 =========
-        self.data_file = SAVED_NEWS_DIR / "news_push_data.json"
-        self._data = {"targets": {}}
-        self._load_data()
-
-        # ========= 内存活跃集合（解决 Bug4：减少文件I/O） =========
-        # 只在内存中记录，定时批量写入文件
-        self._pending_active: set = set()
-        self._last_save_time: float = time.time()
-        self._save_interval: float = 60.0  # 最多60秒写一次文件
-
-        logger.info(f"[每日新闻] 已加载，已知目标: {len(self._data['targets'])} 个")
-        logger.info(f"[每日新闻] 推送窗口: {self.push_start_time} ~ {self.push_end_time}")
-        # 注意：如果 regex 抢走了命令，需要在 AstrBot 后台调整本插件优先级到最低
-        self._monitoring_task = asyncio.create_task(self._daily_task())
-
-    # ==================== 数据持久化 ====================
-
-    def _load_data(self):
-        if self.data_file.exists():
-            try:
-                with open(self.data_file, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
-                if "targets" not in self._data:
-                    self._data["targets"] = {}
-            except Exception as e:
-                logger.error(f"加载推送数据失败: {e}")
-                self._data = {"targets": {}}
-
-        # 兼容旧版迁移
-        old_file = SAVED_NEWS_DIR / "push_groups.json"
-        if old_file.exists():
-            try:
-                with open(old_file, "r", encoding="utf-8") as f:
-                    old_groups = json.load(f)
-                count = 0
-                for g in old_groups:
-                    if g not in self._data["targets"]:
-                        self._data["targets"][g] = self._make_default_target(g, pre_active=True)
-                        count += 1
-                if count > 0:
-                    self._save_data()
-                    logger.info(f"[每日新闻] 从旧版迁移了 {count} 个目标")
-                old_file.rename(old_file.with_suffix(".json.bak"))
-            except Exception as e:
-                logger.error(f"迁移旧数据失败: {e}")
-
-        # 补全旧数据缺少的字段
-        fixed = 0
-        for uid, info in self._data.get("targets", {}).items():
-            if "platform" not in info or "msg_type" not in info:
-                parsed = _parse_msg_origin(uid)
-                info["platform"] = parsed["platform"]
-                info["msg_type"] = parsed["msg_type"]
-                info["target_id"] = parsed["target_id"]
-                fixed += 1
-        if fixed > 0:
-            self._save_data()
-            logger.info(f"[每日新闻] 补全了 {fixed} 条旧数据的字段")
-
-    def _save_data(self):
+    def _resolve_data_dir(self) -> Path:
         try:
-            with open(self.data_file, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-            self._last_save_time = time.time()
-        except Exception as e:
-            logger.error(f"保存推送数据失败: {e}")
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-    def _save_data_throttled(self):
-        """
-        节流保存：距离上次保存超过 _save_interval 秒才真正写文件
-        解决 Bug4：避免每条消息都写文件
-        """
-        now = time.time()
-        if now - self._last_save_time >= self._save_interval:
-            self._save_data()
+            root = Path(get_astrbot_data_path())
+        except (ImportError, AttributeError, TypeError):
+            root = Path("data").resolve()
+        path = root / "plugin_data" / PLUGIN_NAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
-    def _flush_pending_active(self):
-        """
-        将内存中的活跃记录批量写入数据
-        在推送前、插件卸载时调用
-        """
-        if not self._pending_active:
-            return
-        for uid in self._pending_active:
-            if uid in self._data["targets"]:
-                self._data["targets"][uid]["active_after_push"] = True
-                if self._data["targets"][uid].get("dormant"):
-                    self._data["targets"][uid]["dormant"] = False
-                    logger.info(f"[每日新闻] {_get_type_label(uid)} {uid} 从休眠恢复")
-        self._pending_active.clear()
-        self._save_data()
-
-    def _make_default_target(self, unified_id: str, pre_active: bool = False) -> dict:
-        """
-        创建默认的目标数据结构
-        pre_active: True 表示创建时就标记为活跃（用于迁移等场景）
-        """
-        parsed = _parse_msg_origin(unified_id)
+    @staticmethod
+    def _default_state() -> dict:
         return {
-            "platform": parsed["platform"],
-            "msg_type": parsed["msg_type"],      # GroupMessage / FriendMessage / OtherMessage
-            "target_id": parsed["target_id"],
-            "active_after_push": pre_active,
-            "dormant": not pre_active,            # 新发现的默认休眠，等说话再激活
-            "unsubscribed": False,
-            "last_push_date": "",
+            "groups": {},
+            "last_detected_date": "",
+            "last_detected_hash": "",
         }
 
-    def _get_target(self, unified_id: str) -> dict:
-        """获取目标信息，不存在则自动创建"""
-        if unified_id not in self._data["targets"]:
-            # Bug6 防护：OtherMessage 类型也记录，但推送时会跳过
-            self._data["targets"][unified_id] = self._make_default_target(unified_id)
-            self._save_data()
-            type_label = _get_type_label(unified_id)
-            logger.info(f"[每日新闻] 发现新会话 [{type_label}]: {unified_id}")
-        return self._data["targets"][unified_id]
+    def _load_state(self) -> dict:
+        state = self._default_state()
+        if self.state_file.exists():
+            try:
+                loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    state.update(loaded)
+                    if not isinstance(state.get("groups"), dict):
+                        state["groups"] = {}
+            except Exception as exc:
+                logger.error("[头条新闻] 状态文件读取失败，保留原文件并使用空内存状态: %s", exc)
+        self._import_legacy_groups(state)
+        return state
 
-    # ==================== 活跃度检测（重写方案，解决 Bug2/3） ====================
-
-    def _mark_active(self, unified_id: str):
-        """
-        标记某个会话有人说话。
-        只操作内存，不立即写文件（解决 Bug4）。
-        """
-        # 确保目标存在
-        self._get_target(unified_id)
-
-        # 加入待处理集合
-        self._pending_active.add(unified_id)
-
-        # 节流保存
-        self._save_data_throttled()
-
-    # ---- 方案A：通过 on_decorating_result 钩子 ----
-    # 优点：不干扰其他插件和 LLM
-    # 缺点：只有触发了 bot 回复的消息才会被捕获
-    #        纯群聊闲聊（没人 @bot）不会被记录
-    @filter.on_decorating_result()
-    async def _on_any_result(self, event: AstrMessageEvent):
-        """
-        bot 产生回复时触发（作为补充检测）。
-        """
-        if event and hasattr(event, "unified_msg_origin"):
-            self._mark_active_from_event(event)
-
-    def _is_bot_message(self, event: AstrMessageEvent) -> bool:
-        """判断消息是否来自 bot 自身（排除 bot 自己发的消息和其他插件联动）"""
+    def _import_legacy_groups(self, state: dict) -> None:
+        """只迁移旧插件已观察到的群会话，不迁移活跃/休眠/退订逻辑。"""
+        legacy = Path("data/plugin_data/astrbot_plugin_daily_60s_news/news/news_push_data.json").resolve()
+        marker = self.data_dir / ".legacy_groups_imported"
+        if marker.exists() or not legacy.exists():
+            return
         try:
-            sender_id = str(event.get_sender_id()) if hasattr(event, "get_sender_id") else ""
-            bot_id = str(getattr(self.context, "bot_id", ""))
-            if sender_id and bot_id and sender_id == bot_id:
-                return True
+            old = json.loads(legacy.read_text(encoding="utf-8"))
+            count = 0
+            for origin in old.get("targets", {}):
+                if "GroupMessage" not in str(origin):
+                    continue
+                state["groups"].setdefault(str(origin), self._new_group_state())
+                count += 1
+            marker.write_text(str(int(time.time())), encoding="utf-8")
+            if count:
+                logger.info("[头条新闻] 从旧插件导入 %d 个群会话，平台类型将在发送前校验", count)
+        except Exception as exc:
+            logger.warning("[头条新闻] 旧群会话导入失败，不影响新群自动发现: %s", exc)
+
+    @staticmethod
+    def _new_group_state() -> dict:
+        return {
+            "discovered_at": int(time.time()),
+            "last_seen_at": int(time.time()),
+            "last_attempt_date": "",
+            "last_attempt_hash": "",
+            "last_attempt_at": 0,
+            "last_delivery": "NEVER",
+            "last_error": "",
+        }
+
+    def _save_state(self) -> None:
+        tmp = self.state_file.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as file:
+            json.dump(self.state, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, self.state_file)
+
+    def _is_current(self) -> bool:
+        runtime = builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME
+        return runtime.get("instance") is self and runtime.get("generation") == self._generation
+
+    def _loaded_platforms(self) -> dict:
+        manager = getattr(self.context, "platform_manager", None)
+        try:
+            instances = manager.get_insts() if manager and hasattr(manager, "get_insts") else getattr(manager, "platform_insts", [])
         except Exception:
-            pass
-        return False
-
-    def _mark_active_from_event(self, event: AstrMessageEvent):
-        """从事件中提取 unified_id 并标记活跃（排除 bot 自身）"""
-        if not event or not hasattr(event, "unified_msg_origin"):
-            return
-        if self._is_bot_message(event):
-            return
-        unified_id = event.unified_msg_origin
-        # 仅推群聊模式下，私聊消息不记录活跃状态（反正也不会被推送）
-        # 这样可以避免陌生人私聊刷屏时产生大量无意义的磁盘写入 / 数据膨胀
-        if self.group_only_push and _is_private(unified_id):
-            return
-        self._mark_active(unified_id)
-
-    @filter.regex(r"[\s\S]*")
-    async def _catch_all_messages(self, event: AstrMessageEvent):
-        """
-        捕获所有消息用于记录活跃度。
-        不 yield 任何内容 = 不产生回复 = 不阻断其他插件处理。
-        群聊有人说话会被记录；私聊是否记录取决于 group_only_push
-        （开启时私聊不记录，避免无意义的磁盘写入/数据膨胀）。
-        """
-        self._mark_active_from_event(event)
-        # 关键：不 yield 任何东西，消息继续流转给其他 handler
-
-    # ==================== LLM 工具 ====================
-
-    @llm_tool(name="subscribe_news")
-    async def subscribe_news(self, event: AstrMessageEvent) -> str:
-        """订阅每日新闻推送。当用户说想要接收每日新闻、订阅新闻等意图时调用此工具。"""
-        self._mark_active_from_event(event)
-        unified_id = event.unified_msg_origin
-
-        # Bug6 防护
-        if _is_other(unified_id):
-            return "当前会话类型不支持新闻推送。"
-
-        # 只推群聊模式下，私聊无法订阅推送。提前返回，避免为私聊创建持久化记录
-        if self.group_only_push and _is_private(unified_id):
-            return "当前插件设置为仅推送群聊新闻，私聊不支持订阅。"
-
-        target = self._get_target(unified_id)
-        if not target.get("unsubscribed") and not target.get("dormant"):
-            return "当前会话已经在接收每日新闻推送了，无需重复订阅。"
-
-        target["unsubscribed"] = False
-        target["dormant"] = False
-        target["active_after_push"] = True
-        self._save_data()
-
-        type_label = _get_type_label(unified_id)
-        return f"订阅成功！当前{type_label}将在每天 {self.push_start_time} ~ {self.push_end_time} 收到新闻推送。"
-
-    @llm_tool(name="unsubscribe_news")
-    async def unsubscribe_news(self, event: AstrMessageEvent) -> str:
-        """取消订阅每日新闻推送。当用户说不想接收新闻、取消订阅、退订等意图时调用此工具。"""
-        self._mark_active_from_event(event)
-        unified_id = event.unified_msg_origin
-
-        # 只推群聊模式下，私聊本来就不会收到推送，无需创建记录/退订
-        if self.group_only_push and _is_private(unified_id):
-            return "当前插件设置为仅推送群聊新闻，私聊本来就不会收到推送，无需退订。"
-
-        target = self._get_target(unified_id)
-        if target.get("unsubscribed"):
-            return "当前会话已经取消了每日新闻推送。"
-
-        target["unsubscribed"] = True
-        self._save_data()
-        return "取消成功！将不再推送每日新闻。如需重新订阅，随时告诉我。"
-
-    @llm_tool(name="check_news_subscription")
-    async def check_news_subscription(self, event: AstrMessageEvent) -> str:
-        """查询当前新闻推送状态。"""
-        self._mark_active_from_event(event)
-        unified_id = event.unified_msg_origin
-        type_label = _get_type_label(unified_id)
-
-        # 提前判断，避免为私聊创建持久化记录
-        if self.group_only_push and _is_private(unified_id):
-            return "当前插件设置为仅推送群聊新闻，私聊不会收到推送。"
-
-        target = self._get_target(unified_id)
-        if target.get("unsubscribed"):
-            return f"当前{type_label}已退订每日新闻。如需恢复，请告诉我。"
-        elif target.get("dormant"):
-            return (
-                f"当前{type_label}因之前无人与bot互动已暂停推送。"
-                f"现在你说话了，明天将恢复推送。"
-            )
-        else:
-            return f"当前{type_label}正在接收推送，时间为每天 {self.push_start_time} ~ {self.push_end_time}。"
-
-    # ==================== 命令 ====================
-
-    @filter.command_group("新闻管理")
-    def mnews(self):
-        pass
-
-    @filter.command("新闻", alias={"早报", "news"})
-    async def daily_60s_news(self, event: AstrMessageEvent, date_str=None):
-        """获取60s新闻。用法: /新闻 或 /新闻 20250901"""
-        self._mark_active_from_event(event)
-
-        if date_str is not None:
+            instances = []
+        result = {}
+        for instance in instances or []:
             try:
-                target_date = datetime.datetime.strptime(str(date_str), "%Y%m%d")
-            except ValueError:
-                yield event.plain_result("日期格式错误，请用 YYYYMMDD，例如: /新闻 20250901")
-                return
-        else:
-            target_date = None
-
-        news_path, success = await self._get_image_news(target_date)
-        if not success:
-            yield event.plain_result(news_path)
-            return
-        yield event.image_result(news_path)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @mnews.command("status")
-    async def check_status(self, event: AstrMessageEvent):
-        """查看插件状态（管理员）"""
-        self._mark_active_from_event(event)
-        sleep_time = self._calculate_sleep_time()
-        hours = int(sleep_time / 3600)
-        minutes = int((sleep_time % 3600) / 60)
-
-        targets = self._data.get("targets", {})
-        total = len(targets)
-
-        # 分类统计
-        group_active = group_dormant = group_unsub = 0
-        private_active = private_dormant = private_unsub = 0
-        other_count = 0
-
-        for uid, t in targets.items():
-            if _is_other(uid):
-                other_count += 1
-                continue
-
-            unsub = t.get("unsubscribed", False)
-            dormant = t.get("dormant", False)
-
-            if _is_group(uid):
-                if unsub:
-                    group_unsub += 1
-                elif dormant:
-                    group_dormant += 1
-                else:
-                    group_active += 1
-            elif _is_private(uid):
-                if unsub:
-                    private_unsub += 1
-                elif dormant:
-                    private_dormant += 1
-                else:
-                    private_active += 1
-
-        push_mode = "仅群聊" if self.group_only_push else "群聊+私聊"
-        yield event.plain_result(
-            f"📰 每日新闻插件状态\n"
-            f"推送窗口: {self.push_start_time} ~ {self.push_end_time}\n"
-            f"推送范围: {push_mode}\n"
-            f"下次推送: {hours}小时{minutes}分钟后\n"
-            f"待写入活跃记录: {len(self._pending_active)} 条\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"👥 群聊 (共 {group_active + group_dormant + group_unsub})\n"
-            f"  ✅ 活跃: {group_active}\n"
-            f"  💤 休眠: {group_dormant}\n"
-            f"  ❌ 退订: {group_unsub}\n"
-            f"👤 私聊 (共 {private_active + private_dormant + private_unsub})"
-            f"{'（不推送）' if self.group_only_push else ''}\n"
-            f"  ✅ 活跃: {private_active}\n"
-            f"  💤 休眠: {private_dormant}\n"
-            f"  ❌ 退订: {private_unsub}\n"
-            f"❓ 其他: {other_count} (不推送)"
-        )
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @mnews.command("list")
-    async def list_targets(self, event: AstrMessageEvent):
-        """列出所有推送目标（管理员）"""
-        self._mark_active_from_event(event)
-        targets = self._data.get("targets", {})
-        if not targets:
-            yield event.plain_result("暂无任何推送目标。")
-            return
-
-        lines = ["📋 推送目标列表：\n"]
-        for uid, info in targets.items():
-            if self.group_only_push and _is_private(uid):
-                status = "🚫不推(私聊)"
-            elif info.get("unsubscribed"):
-                status = "❌退订"
-            elif info.get("dormant"):
-                status = "💤休眠"
-            else:
-                status = "✅活跃"
-
-            type_label = _get_type_label(uid)
-            parsed = _parse_msg_origin(uid)
-            platform = parsed["platform"]
-            last = info.get("last_push_date") or "从未"
-            lines.append(f"  {status} [{type_label}] {platform} | 上次:{last}\n    {uid}")
-
-        text = "\n".join(lines)
-        if len(text) > 2000:
-            text = text[:2000] + "\n...(过长已截断)"
-        yield event.plain_result(text)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @mnews.command("clean")
-    async def clean_news(self, event: AstrMessageEvent):
-        """清理过期新闻文件（管理员）"""
-        self._mark_active_from_event(event)
-        count = await self._delete_expired_news_files()
-        yield event.plain_result(f"已清理 {count} 个过期新闻文件。")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @mnews.command("push")
-    async def push_news(self, event: AstrMessageEvent):
-        """手动推送新闻（管理员）"""
-        self._mark_active_from_event(event)
-        result = await self._send_daily_news_to_all()
-        yield event.plain_result(f"推送完成。{result}")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @mnews.command("update_news")
-    async def update_news_files(self, event: AstrMessageEvent):
-        """强制重新下载今日新闻（管理员）"""
-        self._mark_active_from_event(event)
-        await self._force_update_news()
-        yield event.plain_result("今日新闻已重新下载。")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @mnews.command("reset")
-    async def reset_target(self, event: AstrMessageEvent, target_uid: str = None):
-        """
-        重置某个目标的状态（管理员）
-        用法: /新闻管理 reset <unified_id>
-        不填则重置当前会话
-        """
-        self._mark_active_from_event(event)
-        uid = target_uid if target_uid else event.unified_msg_origin
-
-        if uid not in self._data["targets"]:
-            yield event.plain_result(f"未找到目标: {uid}")
-            return
-
-        self._data["targets"][uid] = self._make_default_target(uid, pre_active=True)
-        self._save_data()
-        yield event.plain_result(f"已重置: {uid}")
-
-    # ==================== 新闻获取 ====================
-
-    async def _force_update_news(self):
-        image_path, _ = self._get_news_file_path()
-        if _file_exists(image_path):
-            os.remove(image_path)
-        await self._download_news(path=image_path)
-
-    def _get_news_file_path(self, target_date: datetime.datetime = None) -> Tuple[str, str]:
-        if target_date is None:
-            target_date = datetime.datetime.now()
-        current_date = target_date.strftime("%Y%m%d")
-        name = f"{current_date}.jpeg"
-        path = os.path.join(self.news_path, name)
-        return path, name
-
-    async def _get_image_news(self, target_date: datetime.datetime = None) -> Tuple[str, bool]:
-        path, _ = self._get_news_file_path(target_date)
-        if _file_exists(path):
-            return path, True
-        return await self._download_news(path, target_date)
-
-    async def _download_image(self, url: str, path: str, timeout=None) -> Tuple[str, bool]:
-        """下载图片到本地"""
-        if not url or not url.startswith(("http://", "https://")):
-            raise Exception(f"无效的URL: '{url}'")
-        if timeout is None:
-            timeout = aiohttp.ClientTimeout(total=30)
-        elif isinstance(timeout, (int, float)):
-            timeout = aiohttp.ClientTimeout(total=timeout)
-        logger.info(f"[每日新闻] 下载: {url}")
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    with open(path, "wb") as f:
-                        f.write(content)
-                    return path, True
-                else:
-                    raise Exception(f"HTTP {response.status}")
-
-    async def _download_news(self, path: str, target_date: datetime.datetime = None):
-        retries = 3
-        timeout = aiohttp.ClientTimeout(total=30)
-        if target_date is None:
-            target_date = datetime.datetime.now()
-        date = target_date.strftime("%Y-%m-%d")
-
-        for attempt in range(retries):
-            try:
-                if self.news_type == "vikiboss_api":
-                    url = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
-                    return await self._download_image(url, path, timeout)
-
-                elif self.news_type == "indirect":
-                    today = datetime.datetime.now().strftime("%Y-%m-%d")
-
-                    # indirect API 为空 或 请求历史日期 → 直接走 vikiboss
-                    if not self.api or date != today:
-                        fallback = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
-                        if not self.api:
-                            logger.info(f"[每日新闻] indirect API 未配置，使用vikiboss: {fallback}")
-                        else:
-                            logger.info(f"[每日新闻] 请求历史日期 {date}，使用vikiboss: {fallback}")
-                        return await self._download_image(fallback, path, timeout)
-
-                    url = self.api
-                    logger.info(f"[每日新闻] 使用indirect API: {url}")
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, timeout=timeout) as response:
-                            if response.status != 200:
-                                raise Exception(f"API请求失败: HTTP {response.status}")
-                            data = await response.json()
-                            if data.get("code") != 200:
-                                raise Exception(f"API错误: {data.get('msg', '未知')}")
-
-                            api_date = data.get(self.date_key)
-                            if today != api_date:
-                                fallback = f"https://60s-api.viki.moe/v2/60s?date={date}&encoding=image-proxy"
-                                logger.info(f"[每日新闻] API日期不匹配({api_date})，回退vikiboss")
-                                return await self._download_image(fallback, path, timeout)
-
-                            image_url = data.get(self.img_key)
-                            if not image_url:
-                                raise Exception("响应中未找到图片URL")
-                            return await self._download_image(image_url, path, timeout)
-
-                elif self.news_type == "direct":
-                    return await self._download_image(self.img_url, path, timeout)
-
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-                logger.error(f"[每日新闻] 下载失败 {attempt + 1}/{retries}: {err_msg}")
-                if attempt == retries - 1:
-                    return f"新闻获取失败: {err_msg}", False
-                await asyncio.sleep(2)
-        return "新闻获取失败: 未知错误", False
-
-    # ==================== 新闻更新检测 ====================
-
-    def _get_file_hash(self, file_path: str) -> str:
-        """计算文件的 MD5 哈希值"""
-        if not _file_exists(file_path):
-            return ""
-        md5 = hashlib.md5()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                md5.update(chunk)
-        return md5.hexdigest()
-
-    def _is_news_updated(self) -> bool:
-        """
-        检测今天的新闻是否与昨天不同（即是否已更新）。
-        - 昨天的新闻文件不存在 → 视为已更新（首次推送场景）
-        - 今天和昨天哈希相同 → 未更新
-        - 今天和昨天哈希不同 → 已更新
-        """
-        today_path, _ = self._get_news_file_path()
-        yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
-        yesterday_path, _ = self._get_news_file_path(yesterday)
-
-        # 今天新闻还没下载
-        if not _file_exists(today_path):
-            return False
-
-        # 昨天新闻不存在 → 视为更新
-        if not _file_exists(yesterday_path):
-            logger.info("[每日新闻] 昨日新闻文件不存在，视为已更新")
-            return True
-
-        today_hash = self._get_file_hash(today_path)
-        yesterday_hash = self._get_file_hash(yesterday_path)
-
-        if today_hash == yesterday_hash:
-            logger.info(f"[每日新闻] 今日新闻与昨日相同 (hash={today_hash[:12]})，尚未更新")
-            return False
-
-        logger.info(f"[每日新闻] 今日新闻已更新 (today={today_hash[:12]} vs yesterday={yesterday_hash[:12]})")
-        return True
-
-    def _is_past_push_window(self) -> bool:
-        """检查当前时间是否已过推送窗口结束时间"""
-        now = datetime.datetime.now()
-        end_h, end_m = map(int, self.push_end_time.split(":"))
-        today_end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-        return now > today_end
-
-    async def _try_push_with_update_check(self, today_str: str) -> bool:
-        """
-        在推送窗口内反复检测新闻是否已更新，更新后才推送。
-        返回 True 表示已推送，False 表示新闻始终未更新、今日跳过。
-        """
-        start_h, start_m = map(int, self.push_start_time.split(":"))
-        end_h, end_m = map(int, self.push_end_time.split(":"))
-        window_seconds = max((end_h * 60 + end_m - start_h * 60 - start_m) * 60, 60)
-        max_retries = max(int(window_seconds / self.news_check_interval), 1) + 1
-
-        for attempt in range(max_retries):
-            # 检查是否还在推送窗口内
-            if self._is_past_push_window():
-                logger.info("[每日新闻] 推送窗口已结束，今日新闻未更新，跳过推送")
-                return False
-
-            # 第二次及以后的检测，先删除缓存再重新下载
-            if attempt > 0:
-                today_path, _ = self._get_news_file_path()
-                if _file_exists(today_path):
-                    os.remove(today_path)
-
-            # 下载今天的新闻
-            news_path, success = await self._get_image_news()
-            if not success:
-                logger.warning(f"[每日新闻] 第{attempt + 1}次检测：新闻下载失败，等待重试")
-                await asyncio.sleep(self.news_check_interval)
-                continue
-
-            # 比较今天的新闻和昨天的是否相同
-            if self._is_news_updated():
-                logger.info(f"[每日新闻] 新闻已更新，开始推送 (第{attempt + 1}次检测)")
-                await self._delete_expired_news_files()
-                result = await self._send_daily_news_to_all()
-                logger.info(f"[每日新闻] 今日推送完成: {result}")
-                return True
-
-            # 新闻未更新，等待后重试
-            if attempt < max_retries - 1:
-                remaining = int((datetime.datetime.now().replace(
-                    hour=end_h, minute=end_m, second=0
-                ) - datetime.datetime.now()).total_seconds())
-                wait_time = min(self.news_check_interval, max(remaining, 30))
-                logger.info(
-                    f"[每日新闻] 新闻尚未更新，{wait_time}秒后重试 "
-                    f"(第{attempt + 1}/{max_retries}次)"
-                )
-                await asyncio.sleep(wait_time)
-
-        logger.info("[每日新闻] 达到最大检测次数，今日新闻未更新，跳过推送")
-        return False
-
-    # ==================== 推送核心逻辑 ====================
-
-    async def _send_daily_news_to_all(self) -> str:
-        """
-        推送逻辑：
-
-        1. OtherMessage 类型 → 跳过（Bug6 防护）
-        2. group_only_push=True（默认）时，私聊 → 跳过，只推群聊
-        3. 主动退订的 → 跳过
-        4. 今天已推过的 → 跳过
-        5. 上次推送后有人说话 → 推送
-        6. 上次推送后没人说话 → 标记休眠，跳过
-
-        注：私聊即使不推送新闻，仍然正常参与活跃检测/订阅命令等其他逻辑，
-        只是在实际发送新闻这一步被过滤掉。
-        """
-        # 先把内存中的活跃记录刷入数据
-        self._flush_pending_active()
-
-        targets = self._data.get("targets", {})
-        if not targets:
-            logger.info("[每日新闻] 没有任何已知目标")
-            return "没有任何已知目标。"
-
-        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
-        # 预下载新闻（只下载一次）
-        news_path, success = await self._get_image_news()
-        if not success:
-            logger.error(f"[每日新闻] 获取新闻失败: {news_path}")
-            return f"获取新闻失败: {news_path}"
-
-        # 筛选推送目标
-        push_list = []
-        skip_other = 0
-        skip_private = 0
-        skip_unsub = 0
-        skip_already = 0
-        skip_dormant = 0
-        newly_dormant = 0
-
-        for uid, info in targets.items():
-            # Bug6: 跳过 OtherMessage
-            if _is_other(uid):
-                skip_other += 1
-                continue
-
-            # 只推群聊：跳过私聊（不影响私聊的活跃检测/退订等其他功能）
-            if self.group_only_push and _is_private(uid):
-                skip_private += 1
-                continue
-
-            # 今天已推过
-            if info.get("last_push_date") == today_str:
-                skip_already += 1
-                continue
-
-            # 主动退订
-            if info.get("unsubscribed"):
-                skip_unsub += 1
-                continue
-
-            # 核心判断：上次推送后有人说话吗？
-            if info.get("active_after_push"):
-                push_list.append(uid)
-            else:
-                if not info.get("dormant"):
-                    info["dormant"] = True
-                    newly_dormant += 1
-                    type_label = _get_type_label(uid)
-                    logger.info(f"[每日新闻] [{type_label}] {uid} 无人互动，进入休眠")
-                skip_dormant += 1
-
-        self._save_data()
-
-        logger.info(
-            f"[每日新闻] 筛选结果: "
-            f"推送={len(push_list)} "
-            f"休眠={skip_dormant}(新增{newly_dormant}) "
-            f"退订={skip_unsub} "
-            f"已推={skip_already} "
-            f"私聊跳过={skip_private} "
-            f"其他={skip_other}"
-        )
-
-        if not push_list:
-            return f"没有活跃目标。休眠:{skip_dormant} 退订:{skip_unsub} 私聊跳过:{skip_private}"
-
-        # 分散推送
-        start_h, start_m = map(int, self.push_start_time.split(":"))
-        end_h, end_m = map(int, self.push_end_time.split(":"))
-        window_seconds = max((end_h * 60 + end_m - start_h * 60 - start_m) * 60, 60)
-
-        count = len(push_list)
-        interval = window_seconds / count if count > 1 else 0
-        interval = max(interval, self.min_push_interval)
-
-        logger.info(f"[每日新闻] 开始推送 {count} 个目标，间隔 {interval:.1f}s")
-
-        success_count = 0
-        fail_count = 0
-
-        for index, uid in enumerate(push_list):
-            type_label = _get_type_label(uid)
-            try:
-                chain = MessageChain().message("每日新闻播报：").file_image(news_path)
-                await self.context.send_message(uid, chain)
-
-                # 更新状态
-                info = self._data["targets"].get(uid, {})
-                info["last_push_date"] = today_str
-                info["active_after_push"] = False  # 重置，等下次有人说话
-                info["dormant"] = False
-
-                success_count += 1
-                logger.info(f"[每日新闻] ✅ [{type_label}] {uid} ({index + 1}/{count})")
-
-                # 分散推送
-                if index < count - 1 and interval > 0:
-                    await asyncio.sleep(interval)
-
-            except Exception as e:
-                fail_count += 1
-                logger.error(f"[每日新闻] ❌ [{type_label}] {uid} 失败: {e}")
-                await asyncio.sleep(3)
-
-        self._save_data()
-
-        result = f"成功:{success_count} 失败:{fail_count} 休眠:{skip_dormant} 退订:{skip_unsub}"
-        logger.info(f"[每日新闻] 推送完成 - {result}")
-        return result
-
-    # ==================== 定时任务 ====================
-
-    def _calculate_sleep_time(self) -> float:
-        """
-        计算距离下次推送的秒数。
-        如果当前时间在推送窗口内（start ~ end），返回 0（立即推送）。
-        如果已过推送窗口，返回到明天 start 的秒数。
-        """
-        now = datetime.datetime.now()
-        start_h, start_m = map(int, self.push_start_time.split(":"))
-        end_h, end_m = map(int, self.push_end_time.split(":"))
-
-        today_start = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-        today_end = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-
-        # 还没到推送时间
-        if now < today_start:
-            return (today_start - now).total_seconds()
-
-        # 在推送窗口内 → 立即推送
-        if now <= today_end:
-            return 0
-
-        # 已过推送窗口 → 明天
-        tomorrow_start = today_start + datetime.timedelta(days=1)
-        return (tomorrow_start - now).total_seconds()
-
-    async def _delete_expired_news_files(self) -> int:
-        """删除过期新闻文件，返回删除数量"""
-        save_days = self.config.get("save_days", 3)
-        if save_days <= 0:
-            return 0
-        count = 0
-        for filename in os.listdir(self.news_path):
-            if not filename.endswith(".jpeg"):
-                continue
-            try:
-                file_date = datetime.datetime.strptime(filename[:8], "%Y%m%d").date()
-                if (datetime.date.today() - file_date).days >= save_days:
-                    os.remove(os.path.join(self.news_path, filename))
-                    logger.info(f"[每日新闻] 清理: {filename}")
-                    count += 1
+                meta = instance.meta()
+                result[str(meta.id)] = {"name": str(meta.name), "instance": instance}
             except Exception:
                 continue
-        return count
+        return result
 
-    async def _daily_task(self):
-        """
-        定时任务主循环。
-        每60秒检查一次是否到了推送时间，到了就推送。
-        用 last_task_date 防止同一天重复推送。
+    def _is_qq_official_group(self, origin: str) -> bool:
+        if "GroupMessage" not in origin:
+            return False
+        platform_id = origin.split(":", 1)[0]
+        platform = self._loaded_platforms().get(platform_id)
+        return bool(platform and platform.get("name") == "qq_official")
 
-        新增逻辑：启用新闻更新检测时，会在推送窗口内反复检测
-        今日新闻是否与昨日不同，只有更新了才推送。
-        """
-        last_task_date = ""  # 记录上次执行推送的日期
+    def _group_ready(self, origin: str) -> bool:
+        if origin in self._ready_groups:
+            return True
+        platform_id = origin.split(":", 1)[0]
+        platform = self._loaded_platforms().get(platform_id)
+        if not platform or platform.get("name") != "qq_official":
+            return False
+        session_id = origin.split(":", 2)[-1]
+        scenes = getattr(platform.get("instance"), "_session_scene", {})
+        if isinstance(scenes, dict) and scenes.get(session_id) == "group":
+            self._ready_groups.add(origin)
+            return True
+        return False
 
-        while True:
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def observe_group(self, event: AstrMessageEvent):
+        """群主开启全量消息后，任意群消息都会让该 QQ 官方群自动加入推送列表。"""
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        if not self._is_qq_official_group(origin):
+            return
+        self._ready_groups.add(origin)
+        now = int(time.time())
+        is_new = origin not in self.state["groups"]
+        group = self.state["groups"].setdefault(origin, self._new_group_state())
+        # 新群立即落盘；已有群最多每小时更新一次 last_seen，避免全量消息造成磁盘写放大。
+        if is_new or now - int(group.get("last_seen_at", 0) or 0) >= 3600:
+            group["last_seen_at"] = now
+            self._save_state()
+            if is_new:
+                logger.info("[头条新闻] 发现 QQ 官方群: %s", origin)
+
+    @staticmethod
+    def _date_from_arg(date_text: str | None) -> dt.date:
+        if not date_text:
+            return dt.date.today()
+        return dt.datetime.strptime(str(date_text), "%Y%m%d").date()
+
+    def _image_path(self, date_value: dt.date) -> Path:
+        return self.news_dir / f"{date_value.strftime('%Y%m%d')}.jpg"
+
+    @staticmethod
+    def _valid_image_bytes(raw: bytes) -> bool:
+        if len(raw) < 1000:
+            return False
+        return raw.startswith(b"\xff\xd8") or raw.startswith(b"\x89PNG\r\n\x1a\n")
+
+    async def _fetch_news_image(self, date_value: dt.date, force: bool = False) -> tuple[Path, str]:
+        path = self._image_path(date_value)
+        if path.exists() and not force:
+            raw = path.read_bytes()
+            if self._valid_image_bytes(raw):
+                return path, hashlib.sha256(raw).hexdigest()
+
+        params = {
+            "date": date_value.strftime("%Y-%m-%d"),
+            "encoding": "image-proxy",
+        }
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.0)"}
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True, headers=headers) as session:
+            async with session.get(API_URL, params=params) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"NEWS_API_HTTP_{response.status}")
+                raw = await response.read()
+        if not self._valid_image_bytes(raw):
+            raise RuntimeError("NEWS_API_INVALID_IMAGE")
+        tmp = path.with_suffix(".jpg.tmp")
+        with open(tmp, "wb") as file:
+            file.write(raw)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)
+        return path, hashlib.sha256(raw).hexdigest()
+
+    async def _detect_current_news(self) -> tuple[Path, str] | None:
+        today = dt.date.today()
+        yesterday = today - dt.timedelta(days=1)
+        try:
+            _, yesterday_hash = await self._fetch_news_image(yesterday)
+            today_path, today_hash = await self._fetch_news_image(today, force=True)
+        except Exception as exc:
+            logger.warning("[头条新闻] 新闻检测失败: %s", exc)
+            return None
+        if today_hash == yesterday_hash:
+            logger.info("[头条新闻] 今日图片仍与昨日相同，等待下次检查 hash=%s", today_hash[:12])
+            return None
+        self.state["last_detected_date"] = today.isoformat()
+        self.state["last_detected_hash"] = today_hash
+        self._save_state()
+        return today_path, today_hash
+
+    async def _push_news(self, image_path: Path, news_hash: str) -> None:
+        candidates = []
+        today_text = dt.date.today().isoformat()
+        for origin, group in self.state["groups"].items():
+            # 同一自然日最多主动尝试一次；即使 API 当天修订图片也不二次群发。
+            if group.get("last_attempt_date") == today_text:
+                continue
+            if not self._is_qq_official_group(origin):
+                continue
+            if not self._group_ready(origin):
+                logger.info("[头条新闻] 群尚未就绪，保留待推状态: %s", origin)
+                continue
+            candidates.append(origin)
+
+        if not candidates:
+            return
+        logger.info("[头条新闻] 新闻已更新，准备向 %d 个 QQ 官方群推送", len(candidates))
+        for index, origin in enumerate(candidates):
+            if not self._is_current():
+                logger.warning("[头条新闻] 任务实例已失效，中止群发")
+                return
+            group = self.state["groups"][origin]
+            # 先持久化尝试标记；即使 API 超时也不自动重复同一新闻，避免群发事故。
+            group["last_attempt_date"] = today_text
+            group["last_attempt_hash"] = news_hash
+            group["last_attempt_at"] = int(time.time())
+            group["last_delivery"] = "ATTEMPTING"
+            group["last_error"] = ""
+            self._save_state()
             try:
-                sleep_time = self._calculate_sleep_time()
-
-                if sleep_time > 120:
-                    # 离推送时间还早，长睡一会
-                    # 每30分钟醒来刷一次活跃记录
-                    nap = min(sleep_time - 60, 1800)
-                    logger.info(f"[每日新闻] 下次推送: {sleep_time / 3600:.2f} 小时后，休眠 {nap:.0f}s")
-                    await asyncio.sleep(nap)
-                    self._flush_pending_active()
-                    continue
-
-                if sleep_time > 0:
-                    # 快到了，精确等待
-                    logger.info(f"[每日新闻] 即将推送，等待 {sleep_time:.0f}s")
-                    await asyncio.sleep(sleep_time)
-
-                # === 到推送时间了 ===
-                today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-                if today_str == last_task_date:
-                    # 今天已经推过了，等明天
-                    logger.debug("[每日新闻] 今天已执行过推送，跳过")
-                    await asyncio.sleep(60)
-                    continue
-
-                logger.info("[每日新闻] 推送窗口开始，准备执行...")
-                last_task_date = today_str
-
-                if self.enable_news_update_check:
-                    # 启用新闻更新检测：在窗口内反复检测，更新后才推送
-                    logger.info("[每日新闻] 启用新闻更新检测模式")
-                    pushed = await self._try_push_with_update_check(today_str)
-                    if not pushed:
-                        logger.info("[每日新闻] 今日新闻未更新，已跳过推送")
+                chain = MessageChain().message("每日60秒新闻：").file_image(str(image_path))
+                sent = bool(await self.context.send_message(origin, chain))
+                group["last_delivery"] = "SUCCESS" if sent else "FAILED"
+                group["last_error"] = "" if sent else "SEND_RETURNED_FALSE"
+                if sent:
+                    logger.info("[头条新闻] ✅ %s (%d/%d)", origin, index + 1, len(candidates))
                 else:
-                    # 不启用检测：直接推送（原有逻辑）
-                    await self._get_image_news()        # 预下载缓存
-                    await self._delete_expired_news_files()
-                    result = await self._send_daily_news_to_all()
-                    logger.info(f"[每日新闻] 今日推送完成: {result}")
+                    logger.error("[头条新闻] ❌ %s 返回失败", origin)
+            except Exception as exc:
+                group["last_delivery"] = "FAILED"
+                group["last_error"] = type(exc).__name__
+                logger.error("[头条新闻] ❌ %s 发送异常: %s", origin, exc)
+            self._save_state()
+            if index < len(candidates) - 1:
+                await asyncio.sleep(self.send_interval)
 
-                # 推完后等2分钟再进入下一轮循环
-                await asyncio.sleep(120)
+    async def _check_once(self) -> None:
+        detected = await self._detect_current_news()
+        if detected:
+            await self._push_news(*detected)
+        await self._cleanup_images()
 
+    async def _cleanup_images(self) -> None:
+        cutoff = dt.date.today() - dt.timedelta(days=self.save_days)
+        for path in self.news_dir.glob("*.jpg"):
+            try:
+                file_date = dt.datetime.strptime(path.stem, "%Y%m%d").date()
+                if file_date < cutoff:
+                    path.unlink()
+            except Exception:
+                continue
+
+    async def _monitor_loop(self) -> None:
+        while self._is_current():
+            try:
+                await self._check_once()
             except asyncio.CancelledError:
-                logger.info("[每日新闻] 定时任务已取消")
                 break
-            except Exception as e:
-                logger.error(f"[每日新闻] 定时任务出错: {e}")
-                traceback.print_exc()
-                await asyncio.sleep(300)
+            except Exception as exc:
+                logger.exception("[头条新闻] 监控循环异常: %s", exc)
+            try:
+                await asyncio.sleep(self.check_interval)
+            except asyncio.CancelledError:
+                break
+
+    @filter.command("新闻", alias={"早报", "news"})
+    async def news_command(self, event: AstrMessageEvent, date_text: str | None = None):
+        """查看今日或指定日期新闻。用法：/新闻 或 /新闻 20260701"""
+        try:
+            date_value = self._date_from_arg(date_text)
+        except ValueError:
+            yield event.plain_result("日期格式错误，请使用 YYYYMMDD，例如：/新闻 20260701")
+            return
+        try:
+            path, _ = await self._fetch_news_image(date_value)
+        except Exception as exc:
+            yield event.plain_result(f"新闻获取失败：{exc}")
+            return
+        yield event.image_result(str(path))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("新闻状态")
+    async def status_command(self, event: AstrMessageEvent):
+        """查看新闻监控和 QQ 官方群投递状态。"""
+        success = sum(1 for group in self.state["groups"].values() if group.get("last_delivery") == "SUCCESS")
+        failed = sum(1 for group in self.state["groups"].values() if group.get("last_delivery") == "FAILED")
+        ready = sum(1 for origin in self.state["groups"] if self._group_ready(origin))
+        yield event.plain_result(
+            f"📰 头条新闻状态\n"
+            f"检查间隔：{self.check_interval} 秒\n"
+            f"已登记官方群：{len(self.state['groups'])}\n"
+            f"本次启动已就绪：{ready}\n"
+            f"最近成功：{success} / 最近失败：{failed}\n"
+            f"最近新闻日期：{self.state.get('last_detected_date') or '尚未检测'}\n"
+            f"最近内容哈希：{(self.state.get('last_detected_hash') or '')[:12] or '无'}"
+        )
 
     async def terminate(self):
-        """插件卸载"""
-        if self._monitoring_task:
-            self._monitoring_task.cancel()
-        self._flush_pending_active()
-        self._save_data()
-        logger.info("[每日新闻] 插件已停止")
+        runtime = builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if runtime.get("instance") is self:
+            runtime["instance"] = None
+            runtime["task"] = None
+        self._save_state()
+        logger.info("[头条新闻] 插件已停止")
