@@ -279,13 +279,13 @@ class DailyHeadlineFlagPlugin(Star):
             self._save_state()
             try:
                 chain = MessageChain().message("每日60秒新闻：").file_image(str(image_path))
-                sent = bool(await self.context.send_message(origin, chain))
-                group["last_delivery"] = "SUCCESS" if sent else "FAILED"
-                group["last_error"] = "" if sent else "SEND_RETURNED_FALSE"
-                if sent:
-                    logger.info("[头条新闻] ✅ %s (%d/%d)", origin, index + 1, len(candidates))
-                else:
-                    logger.error("[头条新闻] ❌ %s 返回失败", origin)
+                # AstrBot send_message() succeeds by returning None on the QQ
+                # adapter. Only an exception means failure; bool(None) is not
+                # a delivery signal.
+                await self.context.send_message(origin, chain)
+                group["last_delivery"] = "SUCCESS"
+                group["last_error"] = ""
+                logger.info("[头条新闻] ✅ %s (%d/%d)", origin, index + 1, len(candidates))
             except Exception as exc:
                 group["last_delivery"] = "FAILED"
                 group["last_error"] = type(exc).__name__
@@ -335,9 +335,10 @@ class DailyHeadlineFlagPlugin(Star):
             chain = MessageChain().message("每日60秒新闻：").file_image(
                 str(image_path)
             )
-            sent = bool(await self.context.send_message(origin, chain))
-            if not sent:
-                raise RuntimeError("SEND_RETURNED_FALSE")
+            # QQ Official's adapter returns None after a successful send.
+            # Delivery failure is represented by an exception, not a truthy
+            # return value.
+            await self.context.send_message(origin, chain)
         except Exception as exc:
             logger.warning("[头条新闻] 主动消息订阅测试失败 %s: %s", origin, exc)
             yield event.plain_result(
@@ -360,6 +361,13 @@ class DailyHeadlineFlagPlugin(Star):
         )
         self._save_state()
         logger.info("[头条新闻] 当前群订阅并通过主动消息测试: %s", origin)
+
+    @filter.command("新闻订阅", alias={"订阅新闻"})
+    async def subscribe_news_command(self, event: AstrMessageEvent):
+        """订阅当前 QQ 官方群，并立即验证一次主动消息。"""
+        event.stop_event()
+        async for result in self._subscribe_current_group(event):
+            yield result
 
     @filter.command("新闻", alias={"早报", "news"})
     async def news_command(self, event: AstrMessageEvent, date_text: str | None = None):
