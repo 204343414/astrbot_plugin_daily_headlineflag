@@ -14,6 +14,8 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
+from . import qq_group_event_bridge
+
 PLUGIN_NAME = "astrbot_plugin_daily_headlineflag"
 API_URL = "https://60s-api.viki.moe/v2/60s"
 
@@ -29,7 +31,7 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
     "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
-    "1.1.2",
+    "1.2.0",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -59,6 +61,7 @@ class DailyHeadlineFlagPlugin(Star):
         runtime["instance"] = self
         self._task = asyncio.create_task(self._monitor_loop())
         runtime["task"] = self._task
+        qq_group_event_bridge.install(PLUGIN_NAME, self._on_group_del_robot)
 
         logger.info("[头条新闻] 数据目录: %s", self.data_dir)
         logger.info("[头条新闻] 已登记 QQ 官方群: %d", len(self.state["groups"]))
@@ -455,7 +458,22 @@ class DailyHeadlineFlagPlugin(Star):
             f"最近内容哈希：{(self.state.get('last_detected_hash') or '')[:12] or '无'}"
         )
 
+    async def _on_group_del_robot(self, client, event) -> None:
+        group_openid = str(getattr(event, "group_openid", "") or "").strip()
+        platform = getattr(client, "platform", None)
+        if not group_openid or platform is None:
+            return
+        origin = f"{platform.meta().id}:GroupMessage:{group_openid}"
+        removed = self.state["groups"].pop(origin, None)
+        self._ready_groups.discard(origin)
+        if removed is not None:
+            self._save_state()
+            logger.warning("[头条新闻] Bot被移出群，已清空订阅目标: %s", origin)
+        else:
+            logger.info("[头条新闻] Bot被移出未订阅群: %s", origin)
+
     async def terminate(self):
+        qq_group_event_bridge.detach(PLUGIN_NAME)
         runtime = builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME
         if self._task and not self._task.done():
             self._task.cancel()
