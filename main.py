@@ -329,20 +329,23 @@ class DailyHeadlineFlagPlugin(Star):
         if not self._is_qq_official_group(origin):
             yield event.plain_result("仅支持在 QQ 官方群内订阅新闻。")
             return
+        existing = self.state["groups"].get(origin)
+        if isinstance(existing, dict) and bool(existing.get("subscribed", False)):
+            yield event.plain_result("该群已加入每日新闻订阅，无需重复订阅。")
+            return
+
         self._ready_groups.add(origin)
         try:
-            image_path, news_hash = await self._fetch_news_image(dt.date.today())
-            chain = MessageChain().message("每日60秒新闻：").file_image(
-                str(image_path)
+            # This message itself is the proactive-send capability probe and
+            # the sole success response. Do not send a news card here.
+            await self.context.send_message(
+                origin,
+                MessageChain().message("✅ 新闻订阅成功，今后将向本群主动推送每日60秒新闻。"),
             )
-            # QQ Official's adapter returns None after a successful send.
-            # Delivery failure is represented by an exception, not a truthy
-            # return value.
-            await self.context.send_message(origin, chain)
         except Exception as exc:
             logger.warning("[头条新闻] 主动消息订阅测试失败 %s: %s", origin, exc)
             yield event.plain_result(
-                "订阅测试失败，请让群主开启 Bot 的“机器人主动在群聊内发言”功能后重试。"
+                "订阅失败，请@群主开启 Bot 的“机器人主动在群聊内发言”功能后重试。"
             )
             return
 
@@ -352,10 +355,7 @@ class DailyHeadlineFlagPlugin(Star):
             {
                 "subscribed": True,
                 "last_seen_at": now,
-                "last_attempt_date": dt.date.today().isoformat(),
-                "last_attempt_hash": news_hash,
-                "last_attempt_at": now,
-                "last_delivery": "SUCCESS",
+                "last_delivery": "NEVER",
                 "last_error": "",
             }
         )
