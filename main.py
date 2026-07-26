@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -28,7 +29,7 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
     "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
-    "1.1.1",
+    "1.1.2",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -246,6 +247,12 @@ class DailyHeadlineFlagPlugin(Star):
         self._save_state()
         return today_path, today_hash
 
+    @staticmethod
+    def _is_active_message_permission_error(error: object) -> bool:
+        """Only match QQ's explicit proactive-message permission rejection."""
+        text = re.sub(r"\s+", "", str(error or "")).lower()
+        return "主动消息失败" in text and "无权限" in text
+
     async def _push_news(self, image_path: Path, news_hash: str) -> None:
         candidates = []
         today_text = dt.date.today().isoformat()
@@ -288,8 +295,24 @@ class DailyHeadlineFlagPlugin(Star):
                 logger.info("[头条新闻] ✅ %s (%d/%d)", origin, index + 1, len(candidates))
             except Exception as exc:
                 group["last_delivery"] = "FAILED"
-                group["last_error"] = type(exc).__name__
-                logger.error("[头条新闻] ❌ %s 发送异常: %s", origin, exc)
+                group["last_error"] = str(exc)[:500] or type(exc).__name__
+                if self._is_active_message_permission_error(exc):
+                    # Only QQ's explicit permission rejection removes the group
+                    # from the active subscription list. Transient failures keep it.
+                    group["subscribed"] = False
+                    group["unsubscribed_reason"] = "ACTIVE_MESSAGE_PERMISSION_DENIED"
+                    group["unsubscribed_at"] = int(time.time())
+                    logger.warning(
+                        "[头条新闻] 主动消息无权限，已自动移出订阅名单: %s error=%s",
+                        origin,
+                        exc,
+                    )
+                else:
+                    logger.error(
+                        "[头条新闻] ❌ %s 临时发送异常，保留订阅: %s",
+                        origin,
+                        exc,
+                    )
             self._save_state()
             if index < len(candidates) - 1:
                 await asyncio.sleep(self.send_interval)
@@ -359,6 +382,8 @@ class DailyHeadlineFlagPlugin(Star):
                 "last_error": "",
             }
         )
+        group.pop("unsubscribed_reason", None)
+        group.pop("unsubscribed_at", None)
         self._save_state()
         logger.info("[头条新闻] 当前群订阅并通过主动消息测试: %s", origin)
 
