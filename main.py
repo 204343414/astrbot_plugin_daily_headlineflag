@@ -28,7 +28,7 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
     "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
-    "1.1.0",
+    "1.1.1",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -368,6 +368,24 @@ class DailyHeadlineFlagPlugin(Star):
         event.stop_event()
         async for result in self._subscribe_current_group(event):
             yield result
+
+    @filter.command("新闻取消订阅", alias={"取消新闻订阅"})
+    async def unsubscribe_news_command(self, event: AstrMessageEvent):
+        """仅取消当前 QQ 官方群的每日新闻主动推送。"""
+        event.stop_event()
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        if not self._is_qq_official_group(origin):
+            yield event.plain_result("仅支持在 QQ 官方群内取消新闻订阅。")
+            return
+        group = self.state["groups"].get(origin)
+        if not isinstance(group, dict) or not bool(group.get("subscribed", False)):
+            yield event.plain_result("该群当前没有订阅每日新闻。")
+            return
+        group["subscribed"] = False
+        group["last_seen_at"] = int(time.time())
+        self._save_state()
+        logger.info("[头条新闻] 当前群已取消订阅: %s", origin)
+        yield event.plain_result("✅ 已取消本群的每日新闻订阅。")
 
     @filter.command("新闻", alias={"早报", "news"})
     async def news_command(self, event: AstrMessageEvent, date_text: str | None = None):
