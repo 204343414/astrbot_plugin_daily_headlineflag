@@ -27,8 +27,8 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
 @register(
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
-    "QQ官方群每日60秒新闻：检测今日新闻更新后向所有已观察群主动推送一次",
-    "1.0.0",
+    "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
+    "1.1.0",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -91,6 +91,11 @@ class DailyHeadlineFlagPlugin(Star):
                     state.update(loaded)
                     if not isinstance(state.get("groups"), dict):
                         state["groups"] = {}
+                    # Legacy groups were discovered automatically. Explicitly
+                    # keep them unsubscribed until /新闻 订阅此群 succeeds.
+                    for group in state["groups"].values():
+                        if isinstance(group, dict):
+                            group.setdefault("subscribed", False)
             except Exception as exc:
                 logger.error("[头条新闻] 状态文件读取失败，保留原文件并使用空内存状态: %s", exc)
         return state
@@ -98,6 +103,7 @@ class DailyHeadlineFlagPlugin(Star):
     @staticmethod
     def _new_group_state() -> dict:
         return {
+            "subscribed": False,
             "discovered_at": int(time.time()),
             "last_seen_at": int(time.time()),
             "last_attempt_date": "",
@@ -175,20 +181,10 @@ class DailyHeadlineFlagPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def observe_group(self, event: AstrMessageEvent):
-        """群主开启全量消息后，任意群消息都会让该 QQ 官方群自动加入推送列表。"""
+        """Only remember runtime readiness; ordinary messages never subscribe a group."""
         origin = str(getattr(event, "unified_msg_origin", "") or "")
-        if not self._is_qq_official_group(origin):
-            return
-        self._ready_groups.add(origin)
-        now = int(time.time())
-        is_new = origin not in self.state["groups"]
-        group = self.state["groups"].setdefault(origin, self._new_group_state())
-        # 新群立即落盘；已有群最多每小时更新一次 last_seen，避免全量消息造成磁盘写放大。
-        if is_new or now - int(group.get("last_seen_at", 0) or 0) >= 3600:
-            group["last_seen_at"] = now
-            self._save_state()
-            if is_new:
-                logger.info("[头条新闻] 发现 QQ 官方群: %s", origin)
+        if self._is_qq_official_group(origin):
+            self._ready_groups.add(origin)
 
     @staticmethod
     def _date_from_arg(date_text: str | None) -> dt.date:
@@ -254,6 +250,8 @@ class DailyHeadlineFlagPlugin(Star):
         candidates = []
         today_text = dt.date.today().isoformat()
         for origin, group in self.state["groups"].items():
+            if not bool(group.get("subscribed", False)):
+                continue
             # 同一自然日最多主动尝试一次；即使 API 当天修订图片也不二次群发。
             if group.get("last_attempt_date") == today_text:
                 continue
@@ -326,9 +324,51 @@ class DailyHeadlineFlagPlugin(Star):
             except asyncio.CancelledError:
                 break
 
+    async def _subscribe_current_group(self, event: AstrMessageEvent):
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        if not self._is_qq_official_group(origin):
+            yield event.plain_result("仅支持在 QQ 官方群内订阅新闻。")
+            return
+        self._ready_groups.add(origin)
+        try:
+            image_path, news_hash = await self._fetch_news_image(dt.date.today())
+            chain = MessageChain().message("每日60秒新闻：").file_image(
+                str(image_path)
+            )
+            sent = bool(await self.context.send_message(origin, chain))
+            if not sent:
+                raise RuntimeError("SEND_RETURNED_FALSE")
+        except Exception as exc:
+            logger.warning("[头条新闻] 主动消息订阅测试失败 %s: %s", origin, exc)
+            yield event.plain_result(
+                "订阅测试失败，请让群主开启 Bot 的“机器人主动在群聊内发言”功能后重试。"
+            )
+            return
+
+        now = int(time.time())
+        group = self.state["groups"].setdefault(origin, self._new_group_state())
+        group.update(
+            {
+                "subscribed": True,
+                "last_seen_at": now,
+                "last_attempt_date": dt.date.today().isoformat(),
+                "last_attempt_hash": news_hash,
+                "last_attempt_at": now,
+                "last_delivery": "SUCCESS",
+                "last_error": "",
+            }
+        )
+        self._save_state()
+        logger.info("[头条新闻] 当前群订阅并通过主动消息测试: %s", origin)
+
     @filter.command("新闻", alias={"早报", "news"})
     async def news_command(self, event: AstrMessageEvent, date_text: str | None = None):
-        """查看今日或指定日期新闻。用法：/新闻 或 /新闻 20260701"""
+        """查看新闻或订阅当前群。用法：/新闻 [YYYYMMDD|订阅此群]"""
+        if str(date_text or "").strip() == "订阅此群":
+            event.stop_event()
+            async for result in self._subscribe_current_group(event):
+                yield result
+            return
         try:
             date_value = self._date_from_arg(date_text)
         except ValueError:
@@ -346,13 +386,18 @@ class DailyHeadlineFlagPlugin(Star):
     async def status_command(self, event: AstrMessageEvent):
         """查看新闻监控和 QQ 官方群投递状态。"""
         self._prune_non_official_groups()
+        subscribed = sum(
+            1
+            for group in self.state["groups"].values()
+            if bool(group.get("subscribed", False))
+        )
         success = sum(1 for group in self.state["groups"].values() if group.get("last_delivery") == "SUCCESS")
         failed = sum(1 for group in self.state["groups"].values() if group.get("last_delivery") == "FAILED")
         ready = sum(1 for origin in self.state["groups"] if self._group_ready(origin))
         yield event.plain_result(
             f"📰 头条新闻状态\n"
             f"检查间隔：{self.check_interval} 秒\n"
-            f"已登记官方群：{len(self.state['groups'])}\n"
+            f"已订阅官方群：{subscribed}\n"
             f"本次启动已就绪：{ready}\n"
             f"最近成功：{success} / 最近失败：{failed}\n"
             f"最近新闻日期：{self.state.get('last_detected_date') or '尚未检测'}\n"
