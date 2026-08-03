@@ -4,6 +4,11 @@
     "type": "int",
     "default": 300
   },
+  "pending_report_interval_seconds": {
+    "description": "「群尚未就绪」提示的最短间隔（秒），最低60，默认3600=1小时。就绪群集合发生变化时会立即提示一次，不受此间隔限制。",
+    "type": "int",
+    "default": 3600
+  },
   "send_interval_seconds": {
     "description": "向不同QQ群主动推送之间的间隔（秒），最低3，默认5秒，为Bot总QPM保留余量",
     "type": "float",

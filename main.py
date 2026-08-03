@@ -31,7 +31,7 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
     "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
-    "1.2.0",
+    "1.3.0",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -50,6 +50,19 @@ class DailyHeadlineFlagPlugin(Star):
         self.state = self._load_state()
         self._save_state()
         self._ready_groups: set[str] = set()
+        # Throttled reporting of "waiting for the group to become ready".
+        # This is a *steady state*, not an event: _group_ready() depends on the
+        # adapter's _session_scene, which is only populated when somebody
+        # speaks in the group, so after a restart it stays false until then.
+        # The loop re-checks every check_interval seconds and used to log one
+        # line *per group per cycle* -- with 10 groups that is 2880 lines a day
+        # saying nothing changed. Report at most once an hour, and only when
+        # the set of waiting groups actually differs from what was last said.
+        self.pending_report_interval = max(
+            int(config.get("pending_report_interval_seconds", 3600)), 60
+        )
+        self._pending_reported_at: float = 0.0
+        self._pending_reported_key: frozenset[str] = frozenset()
 
         runtime = builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME
         old_task = runtime.get("task")
@@ -258,6 +271,7 @@ class DailyHeadlineFlagPlugin(Star):
 
     async def _push_news(self, image_path: Path, news_hash: str) -> None:
         candidates = []
+        pending: list[str] = []
         today_text = dt.date.today().isoformat()
         for origin, group in self.state["groups"].items():
             if not bool(group.get("subscribed", False)):
@@ -268,9 +282,11 @@ class DailyHeadlineFlagPlugin(Star):
             if not self._is_qq_official_group(origin):
                 continue
             if not self._group_ready(origin):
-                logger.info("[头条新闻] 群尚未就绪，保留待推状态: %s", origin)
+                pending.append(origin)
                 continue
             candidates.append(origin)
+
+        self._report_pending(pending)
 
         if not candidates:
             return
@@ -319,6 +335,41 @@ class DailyHeadlineFlagPlugin(Star):
             self._save_state()
             if index < len(candidates) - 1:
                 await asyncio.sleep(self.send_interval)
+
+    def _report_pending(self, pending: list[str]) -> None:
+        """Summarise groups still waiting, at most once per report interval.
+
+        Silence is not the goal -- an unreported backlog would hide a genuinely
+        stuck subscription. So the summary is still emitted, but as one line
+        for all groups instead of one per group, and only when either the
+        interval has elapsed or the *set* of waiting groups changed. A change
+        is always worth saying immediately: it means a group just became ready,
+        or a new one started waiting.
+        """
+        key = frozenset(pending)
+        if key == self._pending_reported_key:
+            if not pending:
+                return
+            if (time.time() - self._pending_reported_at) < self.pending_report_interval:
+                return
+        self._pending_reported_key = key
+        self._pending_reported_at = time.time()
+        if not pending:
+            logger.info("[头条新闻] 所有订阅群均已就绪")
+            return
+        names = sorted(origin.split(":")[-1] for origin in pending)
+        # A subscriber list can be long; the count is the actionable part and
+        # the ids are only there to identify a genuinely stuck group.
+        shown = ", ".join(names[:5])
+        if len(names) > 5:
+            shown += f" 等 {len(names)} 个"
+        logger.info(
+            "[头条新闻] %d 个群尚未就绪，保留待推状态（群内有人发言后自动就绪）；"
+            "每 %d 秒最多提示一次: %s",
+            len(pending),
+            self.pending_report_interval,
+            shown,
+        )
 
     async def _check_once(self) -> None:
         self._prune_non_official_groups()
