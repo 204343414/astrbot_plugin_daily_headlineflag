@@ -31,20 +31,18 @@ git clone https://github.com/eeetechen/astrbot_plugin_daily_news.git
 ⚙️ 配置说明
 在 AstrBot 管理面板的插件配置页面中设置：
 
-配置项	说明	默认值
-news_type	新闻获取方式：vikiboss_api / indirect / direct	indirect
-vikiboss_api	vikiboss API 地址	https://60s-api.viki.moe/v2/60s
-indirect	间接 API 地址（返回 JSON 包含图片 URL）	-
-img_key	间接 API 返回 JSON 中图片 URL 的键名	imageUrl
-date_key	间接 API 返回 JSON 中日期的键名	datatime
-direct	直接图片 URL	-
-push_start_time	推送窗口开始时间（HH:MM）	07:00
-push_end_time	推送窗口结束时间（HH:MM）	07:15
-save_days	新闻图片本地保留天数	3
-min_push_interval	每个目标之间的最小推送间隔（秒）	5.0
-group_only_push	是否只推送到群聊（关闭后群聊+私聊都推）	true
+| 配置项 | 说明 | 默认值 |
+| --- | --- | --- |
+| `check_interval_seconds` | 全天新闻更新检查间隔（秒），最低 60 | `300`（5 分钟） |
+| `pending_report_interval_seconds` | 「群尚未就绪」提示的最短间隔（秒），最低 60。就绪群集合变化时会立即提示一次，不受此间隔限制 | `3600`（1 小时） |
+| `send_interval_seconds` | 向不同 QQ 群主动推送之间的间隔（秒），最低 3，为 Bot 总 QPM 留余量 | `5.0` |
+| `save_days` | 新闻图片本地保留天数，至少 2 天以便比较昨日与今日内容 | `3` |
 
-> ⚠️ 上表为旧版本遗留，与当前 `_conf_schema.json` 已不一致，以管理面板实际显示为准。
+以上就是全部配置项，与 `_conf_schema.json` 一一对应。
+
+> 早期版本曾有 `news_type`、`push_start_time`、`group_only_push` 等选项，**现已全部移除**：
+> 新闻源固定、推送时机由「检测到更新」驱动而不是时间窗口。看到旧文档提到这些字段时，
+> 以管理面板实际显示为准。
 
 ### 日志：`群尚未就绪` 不会再刷屏
 
