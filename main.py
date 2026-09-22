@@ -17,7 +17,16 @@ from astrbot.api.star import Context, Star, register
 from . import qq_group_event_bridge
 
 PLUGIN_NAME = "astrbot_plugin_daily_headlineflag"
-API_URL = "https://60s-api.viki.moe/v2/60s"
+# 60s API 的官方域名近期会返回 Cloudflare 403。优先使用官方文档列出的
+# 公共实例，失败时自动切换到其他实例；把官方源保留在末尾，避免它恢复后
+# 还需要再次发布插件才能用回官方服务。
+API_URL = "https://60s.crystelf.top/v2/60s"
+API_FALLBACK_URLS = (
+    "https://api.elysiayanyu.top/v2/60s",
+    "https://60s.7se.cn/v2/60s",
+    "https://60s.mizhoubaobei.top/v2/60s",
+    "https://60s-api.viki.moe/v2/60s",
+)
 
 if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME = {
@@ -31,7 +40,7 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
     "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
-    "1.3.0",
+    "1.3.1",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -230,21 +239,43 @@ class DailyHeadlineFlagPlugin(Star):
             "encoding": "image-proxy",
         }
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.0)"}
+        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.3.1)"}
+        errors: list[str] = []
+        api_urls = (API_URL, *API_FALLBACK_URLS)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True, headers=headers) as session:
-            async with session.get(API_URL, params=params) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"NEWS_API_HTTP_{response.status}")
-                raw = await response.read()
-        if not self._valid_image_bytes(raw):
-            raise RuntimeError("NEWS_API_INVALID_IMAGE")
-        tmp = path.with_suffix(".jpg.tmp")
-        with open(tmp, "wb") as file:
-            file.write(raw)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(tmp, path)
-        return path, hashlib.sha256(raw).hexdigest()
+            for index, api_url in enumerate(api_urls):
+                try:
+                    async with session.get(api_url, params=params) as response:
+                        if response.status != 200:
+                            error = f"NEWS_API_HTTP_{response.status}"
+                            errors.append(f"{api_url}: {error}")
+                            continue
+                        raw = await response.read()
+                except Exception as exc:
+                    errors.append(f"{api_url}: {type(exc).__name__}")
+                    continue
+
+                if not self._valid_image_bytes(raw):
+                    errors.append(f"{api_url}: NEWS_API_INVALID_IMAGE")
+                    continue
+
+                if index:
+                    logger.warning(
+                        "[头条新闻] 主新闻源不可用，已切换备用源: %s",
+                        api_url,
+                    )
+                tmp = path.with_suffix(".jpg.tmp")
+                with open(tmp, "wb") as file:
+                    file.write(raw)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(tmp, path)
+                return path, hashlib.sha256(raw).hexdigest()
+
+        # 不把上游返回的整段 Cloudflare HTML 传给 QQ；保留各源的状态，
+        # 方便日志定位，同时让命令回复保持简短。
+        detail = "; ".join(errors[-3:]) if errors else "no response"
+        raise RuntimeError(f"NEWS_API_UNAVAILABLE: {detail}")
 
     async def _detect_current_news(self) -> tuple[Path, str] | None:
         today = dt.date.today()

@@ -40,6 +40,12 @@ git clone https://github.com/eeetechen/astrbot_plugin_daily_news.git
 
 以上就是全部配置项，与 `_conf_schema.json` 一一对应。
 
+### 新闻源故障转移
+
+60s API 官方域名偶尔会被 Cloudflare 返回 `403`。插件 1.3.1 起优先使用公共实例，
+并在请求超时、HTTP 错误或返回非图片时自动切换备用实例，不需要额外配置；所有实例均只请求
+`image-proxy` 图片接口。
+
 > 早期版本曾有 `news_type`、`push_start_time`、`group_only_push` 等选项，**现已全部移除**：
 > 新闻源固定、推送时机由「检测到更新」驱动而不是时间窗口。看到旧文档提到这些字段时，
 > 以管理面板实际显示为准。
