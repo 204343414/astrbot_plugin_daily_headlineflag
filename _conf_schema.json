@@ -1,4 +1,9 @@
 {
+  "push_requires_group_activity": {
+    "description": "是否要求「群里有人说过话」才允许主动推送（活跃检测/休眠机制）。true=保持原行为：Bot 本次启动后没收到过群消息的群视为未就绪，新闻更新时跳过推送，等群内有人发言后自动恢复；false=关闭该限制，只要具备主动消息权限就直接推送，无需等群友发言、Bot 重启后也能照常推送（无权限时仍会按原逻辑记 FAILED 并自动移出订阅名单）。",
+    "type": "bool",
+    "default": true
+  },
   "check_interval_seconds": {
     "description": "全天新闻更新检查间隔（秒），最低60，默认300=5分钟",
     "type": "int",

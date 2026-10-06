@@ -40,7 +40,7 @@ if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     "astrbot_plugin_daily_headlineflag",
     "ハ·七",
     "QQ官方群每日60秒新闻：仅向主动订阅并通过主动消息测试的群推送",
-    "1.3.1",
+    "1.3.2",
     "",
 )
 class DailyHeadlineFlagPlugin(Star):
@@ -51,6 +51,12 @@ class DailyHeadlineFlagPlugin(Star):
         self.check_interval = max(int(config.get("check_interval_seconds", 300)), 60)
         self.send_interval = max(float(config.get("send_interval_seconds", 5.0)), 3.0)
         self.save_days = max(int(config.get("save_days", 3)), 2)
+        # 「群里有人说过话才算就绪」这道闸门的开关。默认 true 保持既有行为；
+        # 关掉以后不再看群活跃度，只要主动消息权限在（订阅时已探针验证过，
+        # 发送被 QQ 明确拒绝时仍会自动移出订阅名单）就直接推送。
+        self.require_group_activity = bool(
+            config.get("push_requires_group_activity", True)
+        )
 
         self.data_dir = self._resolve_data_dir()
         self.news_dir = self.data_dir / "news"
@@ -88,6 +94,12 @@ class DailyHeadlineFlagPlugin(Star):
         logger.info("[头条新闻] 数据目录: %s", self.data_dir)
         logger.info("[头条新闻] 已登记 QQ 官方群: %d", len(self.state["groups"]))
         logger.info("[头条新闻] 全天每 %d 秒检查新闻更新", self.check_interval)
+        logger.info(
+            "[头条新闻] 群活跃检查: %s",
+            "开启（仅推送给本轮启动后有人发言的群）"
+            if self.require_group_activity
+            else "关闭（不检查群活跃，有主动消息权限即推送）",
+        )
 
     def _resolve_data_dir(self) -> Path:
         try:
@@ -198,6 +210,11 @@ class DailyHeadlineFlagPlugin(Star):
         platform = self._loaded_platforms().get(platform_id)
         if not platform or platform.get("name") != "qq_official":
             return False
+        if not self.require_group_activity:
+            # 活动闸门已关闭：QQ 官方平台在跑、群目标是订阅过的（调用方已判定），
+            # 就认为可以推送。这里刻意 *不* 写入 _ready_groups 缓存，否则运行中把
+            # 配置改回 true 时，这些群会带着上一轮的"就绪"标记继续推。
+            return True
         session_id = origin.split(":", 2)[-1]
         scenes = getattr(platform.get("instance"), "_session_scene", {})
         if isinstance(scenes, dict) and scenes.get(session_id) == "group":
@@ -239,7 +256,7 @@ class DailyHeadlineFlagPlugin(Star):
             "encoding": "image-proxy",
         }
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.3.1)"}
+        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.3.2)"}
         errors: list[str] = []
         api_urls = (API_URL, *API_FALLBACK_URLS)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True, headers=headers) as session:
@@ -533,6 +550,7 @@ class DailyHeadlineFlagPlugin(Star):
         yield event.plain_result(
             f"📰 头条新闻状态\n"
             f"检查间隔：{self.check_interval} 秒\n"
+            f"群活跃检查：{'开启（需群内有人发言）' if self.require_group_activity else '关闭（有主动消息权限即推送）'}\n"
             f"已订阅官方群：{subscribed}\n"
             f"本次启动已就绪：{ready}\n"
             f"最近成功：{success} / 最近失败：{failed}\n"
