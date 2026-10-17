@@ -28,6 +28,21 @@ API_FALLBACK_URLS = (
     "https://60s-api.viki.moe/v2/60s",
 )
 
+
+def _config_bool(value, default: bool) -> bool:
+    """Parse WebUI values without treating the string ``"false"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on", "enabled", "是", "开启", "打开"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "disabled", "否", "关闭", "关"}:
+            return False
+    return default
+
 if not hasattr(builtins, "_ASTRBOT_DAILY_HEADLINE_RUNTIME"):
     builtins._ASTRBOT_DAILY_HEADLINE_RUNTIME = {
         "generation": 0,
@@ -54,8 +69,8 @@ class DailyHeadlineFlagPlugin(Star):
         # 「群里有人说过话才算就绪」这道闸门的开关。默认 true 保持既有行为；
         # 关掉以后不再看群活跃度，只要主动消息权限在（订阅时已探针验证过，
         # 发送被 QQ 明确拒绝时仍会自动移出订阅名单）就直接推送。
-        self.require_group_activity = bool(
-            config.get("push_requires_group_activity", True)
+        self.require_group_activity = _config_bool(
+            config.get("push_requires_group_activity", True), True
         )
 
         self.data_dir = self._resolve_data_dir()

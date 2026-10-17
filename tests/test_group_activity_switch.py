@@ -67,6 +67,13 @@ def test_gate_on_still_waits_for_a_group_message(plugin):
     assert plugin._group_ready(G1) is False
 
 
+def test_string_false_really_disables_group_activity():
+    module = _load_plugin_module()
+    assert module._config_bool("false", True) is False
+    assert module._config_bool("关闭", True) is False
+    assert module._config_bool("true", False) is True
+
+
 def test_gate_on_accepts_the_platform_scene_without_this_process_seen_a_message(plugin):
     """热重载后适配器里已有的 scene 仍然算数（原有行为，别被新开关改坏）。"""
     plugin.require_group_activity = True
