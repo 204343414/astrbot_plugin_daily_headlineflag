@@ -309,17 +309,124 @@ class DailyHeadlineFlagPlugin(Star):
         detail = "; ".join(errors[-3:]) if errors else "no response"
         raise RuntimeError(f"NEWS_API_UNAVAILABLE: {detail}")
 
+    async def _edition_meta(self, date_value: dt.date) -> dict | None:
+        """问上游"你手上这份报纸是哪天的"。
+
+        为什么必须有这一步：60s 系列接口在**请求一个还没发布的日期**时不会报错，
+        而是静默回退成一份更旧的报纸（图片照样返回 200）。所以"图片哈希变了"
+        只能说明内容变了，不能说明拿到的是今天的报纸 —— 只看哈希会在凌晨把
+        昨天的报纸当成今天的推出去。JSON 里的 data.date / data.created 是诚实的，
+        用它来把关。
+        """
+        params = {"date": date_value.strftime("%Y-%m-%d")}
+        timeout = aiohttp.ClientTimeout(total=20, connect=8)
+        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.3.2)"}
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True, headers=headers) as session:
+            for api_url in (API_URL, *API_FALLBACK_URLS):
+                try:
+                    async with session.get(api_url, params=params) as response:
+                        if response.status != 200:
+                            continue
+                        payload = await response.json(content_type=None)
+                except Exception:
+                    continue
+                data = payload.get("data") if isinstance(payload, dict) else None
+                # 个别镜像把 data 返回成列表，取第一项
+                if isinstance(data, list):
+                    data = data[0] if data else None
+                if isinstance(data, dict) and data.get("date"):
+                    return data
+        return None
+
+    async def _fetch_edition_image(
+        self, date_value: dt.date, meta: dict, force: bool = False
+    ) -> tuple[Path, str]:
+        """下载指定日期的封面图：优先用 JSON 里的按日期固定直链，失败再退回 image-proxy。
+
+        直链形如 .../static/images/2026-11-17.png，日期写死在 URL 里，
+        不会像 image-proxy 那样被旧报纸的缓存顶掉。
+        """
+        path = self._image_path(date_value)
+        if path.exists() and not force:
+            raw = path.read_bytes()
+            if self._valid_image_bytes(raw):
+                return path, hashlib.sha256(raw).hexdigest()
+
+        timeout = aiohttp.ClientTimeout(total=45, connect=10)
+        headers = {"User-Agent": "Mozilla/5.0 (AstrBot DailyHeadlineFlag/1.3.2)"}
+        errors: list[str] = []
+        direct = str(meta.get("image") or "")
+        targets = []
+        if direct.startswith("http"):
+            targets.append(("direct", direct, None))
+        params = {"date": date_value.strftime("%Y-%m-%d"), "encoding": "image-proxy"}
+        for api_url in (API_URL, *API_FALLBACK_URLS):
+            targets.append(("proxy", api_url, params))
+
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True, headers=headers) as session:
+            for kind, url, q in targets:
+                try:
+                    if q is None:
+                        async with session.get(url) as response:
+                            if response.status != 200:
+                                errors.append(f"{kind}:{response.status}")
+                                continue
+                            raw = await response.read()
+                    else:
+                        async with session.get(url, params=q) as response:
+                            if response.status != 200:
+                                errors.append(f"{kind}:{response.status}")
+                                continue
+                            raw = await response.read()
+                except Exception as exc:
+                    errors.append(f"{kind}:{type(exc).__name__}")
+                    continue
+                if not self._valid_image_bytes(raw):
+                    errors.append(f"{kind}:INVALID_IMAGE")
+                    continue
+                if kind != "direct":
+                    logger.warning("[头条新闻] 直链不可用，已退回 image-proxy: %s", url)
+                tmp = path.with_suffix(".jpg.tmp")
+                with open(tmp, "wb") as file:
+                    file.write(raw)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(tmp, path)
+                return path, hashlib.sha256(raw).hexdigest()
+
+        detail = "; ".join(errors[-3:]) if errors else "no response"
+        raise RuntimeError(f"NEWS_API_UNAVAILABLE: {detail}")
+
     async def _detect_current_news(self) -> tuple[Path, str] | None:
         today = dt.date.today()
-        yesterday = today - dt.timedelta(days=1)
+
+        # 第一道闸：上游到底有没有"今天"的报纸？
+        # 上游对未发布的日期会静默回退成旧报纸，必须先看 JSON 的 data.date。
+        meta = await self._edition_meta(today)
+        if not meta:
+            logger.warning("[头条新闻] 读不到上游报纸信息，本次跳过（下次继续）")
+            return None
+        edition_date = str(meta.get("date") or "")
+        if edition_date != today.isoformat():
+            logger.info(
+                "[头条新闻] 上游还没发布 %s 的报纸（手上最新是 %s / created %s），继续等",
+                today.isoformat(), edition_date or "未知", meta.get("created") or "未知",
+            )
+            return None
+        created = str(meta.get("created") or "")
+        if created and not created.startswith(today.strftime("%Y/%m/%d")):
+            logger.info("[头条新闻] 上游报纸生成于 %s，不是今天的，继续等", created)
+            return None
+
+        # 第二道闸：图片内容有没有变（和"上次推出去的那份"比，而不是和昨天的文件比）
         try:
-            _, yesterday_hash = await self._fetch_news_image(yesterday)
-            today_path, today_hash = await self._fetch_news_image(today, force=True)
+            today_path, today_hash = await self._fetch_edition_image(today, meta, force=True)
         except Exception as exc:
             logger.warning("[头条新闻] 新闻检测失败: %s", exc)
             return None
-        if today_hash == yesterday_hash:
-            logger.info("[头条新闻] 今日图片仍与昨日相同，等待下次检查 hash=%s", today_hash[:12])
+        last_hash = str(self.state.get("last_detected_hash") or "")
+        if today_hash == last_hash:
+            logger.info("[头条新闻] 今日图片无变化，等待下次检查 hash=%s", today_hash[:12])
             return None
         self.state["last_detected_date"] = today.isoformat()
         self.state["last_detected_hash"] = today_hash
@@ -339,8 +446,10 @@ class DailyHeadlineFlagPlugin(Star):
         for origin, group in self.state["groups"].items():
             if not bool(group.get("subscribed", False)):
                 continue
-            # 同一自然日最多主动尝试一次；即使 API 当天修订图片也不二次群发。
-            if group.get("last_attempt_date") == today_text:
+            # 同一份内容不重发；但如果是"同一天里内容变了"（例如凌晨误推了旧报纸、
+            # 真正的当天报纸之后才发布），必须允许补发一次，否则当天就再也没有机会。
+            if (group.get("last_attempt_date") == today_text
+                    and group.get("last_attempt_hash") == news_hash):
                 continue
             if not self._is_qq_official_group(origin):
                 continue
